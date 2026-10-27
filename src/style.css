@@ -763,3 +763,29 @@ button[aria-expanded="true"] {
   margin: 0;
   font-variant-numeric: tabular-nums;
 }
+
+.candidate-row {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  margin: 7px 0;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.candidate-row strong,
+.candidate-row small {
+  font-size: 10px;
+}
+.candidate-row span {
+  color: #9dc0f8;
+  font-size: 11px;
+}
+.candidate-row.active {
+  border-color: #7eaaff;
+  background: #182b48;
+}
+input[type="file"] {
+  max-width: 100%;
+  font-size: 11px;
+}

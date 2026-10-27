@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
 import {
   Viewer,
+  BillboardCollection,
+  DistanceDisplayCondition,
+  NearFarScalar,
   SingleTileImageryProvider,
   Rectangle,
   Cartesian2,
@@ -44,6 +47,7 @@ type Props = {
   runId: number;
   running: boolean;
   selectedLink: string;
+  previewPath: number[];
   selected: number | null;
   source: number;
   target: number;
@@ -134,6 +138,10 @@ export default function Globe(props: Props) {
       const points = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
       ) as PointPrimitiveCollection;
+      const satelliteIcons = viewer.scene.primitives.add(
+        new BillboardCollection(),
+      ) as BillboardCollection;
+      const iconDistance = 5000000;
       const packets = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
       ) as PointPrimitiveCollection;
@@ -143,6 +151,10 @@ export default function Globe(props: Props) {
       const paths = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
+      const previewLines = viewer.scene.primitives.add(
+        new PolylineCollection(),
+      ) as PolylineCollection;
+      let previewKey = "";
       const orbits = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
@@ -256,11 +268,26 @@ export default function Globe(props: Props) {
         if (config !== p.config) {
           config = p.config;
           points.removeAll();
+          satelliteIcons.removeAll();
           packets.removeAll();
           wireGroups.forEach((group) => group.removeAll());
           paths.removeAll();
+          previewLines.removeAll();
+          previewKey = "";
           orbits.removeAll();
-          for (let id = 0; id < config.planes * config.perPlane; id++)
+          for (let id = 0; id < config.planes * config.perPlane; id++) {
+            satelliteIcons.add({
+              id,
+              position: Cartesian3.ZERO,
+              image: `${import.meta.env.BASE_URL}textures/satellite-node.png`,
+              width: 64,
+              height: 64,
+              distanceDisplayCondition: new DistanceDisplayCondition(
+                0,
+                iconDistance,
+              ),
+              scaleByDistance: new NearFarScalar(100000, 1, iconDistance, 0.5),
+            });
             points.add({
               id,
               position: Cartesian3.ZERO,
@@ -270,7 +297,12 @@ export default function Globe(props: Props) {
               ),
               outlineColor: Color.BLACK,
               outlineWidth: 1,
+              distanceDisplayCondition: new DistanceDisplayCondition(
+                iconDistance,
+                Number.MAX_VALUE,
+              ),
             });
+          }
           for (let i = 0; i < 9; i++)
             packets.add({
               position: Cartesian3.ZERO,
@@ -290,11 +322,17 @@ export default function Globe(props: Props) {
         }
         const pos = positions(p.config, seconds, p.startMs);
         const scenePositions = pos.map(cart);
+        const iconView =
+          Cartesian3.magnitude(viewer.camera.positionWC) <
+          EARTH_RADIUS + p.config.altitude * 1000 + iconDistance;
+        satelliteIcons.show = iconView;
         const styleKey = `${p.selected}:${p.source}:${p.target}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
           dot.position = scenePositions[id];
+          if (iconView) satelliteIcons.get(id).position = scenePositions[id];
           if (styleKey !== lastStyle) {
+            satelliteIcons.get(id).scale = id === p.selected ? 1.25 : 1;
             dot.pixelSize =
               id === p.selected
                 ? 11
@@ -384,6 +422,24 @@ export default function Globe(props: Props) {
             display?.pathValid ? "#80efbb" : "#ff7a82",
           ).withAlpha(0.9);
         }
+        const preview = p.previewPath;
+        const nextPreview = preview.join(":");
+        if (nextPreview !== previewKey) {
+          previewLines.removeAll();
+          if (preview.length > 1) {
+            const line = previewLines.add({
+              positions: preview.map((id) => scenePositions[id]),
+              width: 5,
+            });
+            line.material.uniforms.color =
+              Color.fromCssColorString("#7eaaff").withAlpha(0.75);
+          }
+          previewKey = nextPreview;
+        }
+        if (previewLines.length)
+          previewLines.get(0).positions = preview.map(
+            (id) => scenePositions[id],
+          );
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
           dot.show = path.length > 1 && !!display?.pathValid;

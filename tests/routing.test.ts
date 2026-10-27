@@ -99,14 +99,15 @@ test("BFS keeps hop and tie order regardless of attributes and handles isolated 
     { nodes: [4], propagationDelayMs: 0, availableBufferRatio: 1, jitterMs: 0 },
   ]);
 });
-test("v3 validation and legacy migration preserve deterministic defaults", () => {
+test("v4 validation and legacy migration preserve deterministic defaults", () => {
   const { schemaVersion, linkMetricUpdates, ...legacy } = scenario();
-  for (const version of [undefined, 1, 2]) {
+  for (const version of [undefined, 1, 2, 3]) {
     const s = normalizeScenario({
       ...legacy,
       ...(version === undefined ? {} : { schemaVersion: version }),
+      ...(version === 3 ? { linkMetricUpdates: [] } : {}),
     });
-    assert.equal(s.schemaVersion, 3);
+    assert.equal(s.schemaVersion, 4);
     assert.deepEqual(s.linkMetricUpdates, []);
   }
   for (const bad of [

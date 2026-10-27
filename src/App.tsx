@@ -4,11 +4,14 @@ import type { Telemetry } from "./Globe";
 import { PRESETS, validate, period, mesh } from "./model";
 import {
   createScenario,
+  normalizeScenario,
   validateScenario,
   SECOND,
   edgeId,
   DEFAULT_EPOCH_MS,
 } from "./engine";
+import type { Scenario } from "./engine";
+import type { RoutingSettings } from "./routing";
 import { useSimulation } from "./useSimulation";
 const initial: Telemetry = { latitude: 0, longitude: 0, altitude: 0 };
 const defaultExperiment = {
@@ -17,6 +20,8 @@ const defaultExperiment = {
   computeMs: 1,
   installMs: 1,
   seed: 1,
+  notificationMs: 0,
+  switchMs: 0,
 };
 export default function App() {
   const [config, setConfig] = useState(PRESETS[0].config),
@@ -25,6 +30,8 @@ export default function App() {
     [utcDraft, setUtcDraft] = useState(
       new Date(DEFAULT_EPOCH_MS).toISOString().slice(0, 19),
     ),
+    [loadedScenario, setLoadedScenario] = useState<Scenario | null>(null),
+    [previewId, setPreviewId] = useState(""),
     [playing, setPlaying] = useState(true),
     [speed, setSpeed] = useState(10),
     [selected, setSelected] = useState<number | null>(0),
@@ -44,21 +51,73 @@ export default function App() {
     [left, setLeft] = useState(() => window.innerWidth > 850),
     [right, setRight] = useState(() => window.innerWidth > 850);
   const scenario = useMemo(
-    () => ({
-      ...createScenario(config, startMs, source, target),
-      durationUs: Math.round(experiment.durationSeconds * SECOND),
-      slsIntervalUs: Math.round(experiment.slsMs * 1000),
-      computeDelayUs: Math.round(experiment.computeMs * 1000),
-      installDelayUs: Math.round(experiment.installMs * 1000),
-      seed: experiment.seed,
-    }),
-    [config, startMs, source, target, experiment],
+    () =>
+      loadedScenario ?? {
+        ...createScenario(config, startMs, source, target),
+        durationUs: Math.round(experiment.durationSeconds * SECOND),
+        slsIntervalUs: Math.round(experiment.slsMs * 1000),
+        computeDelayUs: Math.round(experiment.computeMs * 1000),
+        installDelayUs: Math.round(experiment.installMs * 1000),
+        notificationDelayUs: Math.round(experiment.notificationMs * 1000),
+        switchDelayUs: Math.round(experiment.switchMs * 1000),
+        seed: experiment.seed,
+      },
+    [loadedScenario, config, startMs, source, target, experiment],
   );
   const simulation = useSimulation(scenario, playing, speed);
   useEffect(() => {
     if (simulation.ended) setPlaying(false);
   }, [simulation.ended]);
   const frame = simulation.frame;
+  const preview = frame?.routingAnalysis.candidates.find(
+    (c) => c.id === previewId,
+  );
+  useEffect(() => setPreviewId(""), [scenario]);
+  function updateRouting(routing: RoutingSettings) {
+    setLoadedScenario({
+      ...structuredClone(frame?.scenario ?? scenario),
+      routing,
+    });
+  }
+  async function importScenario(file: File) {
+    try {
+      if (file.size > 10 * 1024 * 1024)
+        throw new Error("JSON은 10MB 이하여야 합니다.");
+      const raw = JSON.parse(await file.text());
+      const next = normalizeScenario(raw?.scenario ?? raw);
+      const experiment = {
+        durationSeconds: next.durationUs / SECOND,
+        slsMs: next.slsIntervalUs / 1000,
+        computeMs: next.computeDelayUs / 1000,
+        installMs: next.installDelayUs / 1000,
+        seed: next.seed,
+        notificationMs: next.notificationDelayUs / 1000,
+        switchMs: next.switchDelayUs / 1000,
+      };
+      setConfig(next.config);
+      setDraft(next.config);
+      setStartMs(next.epochMs);
+      setUtcDraft(new Date(next.epochMs).toISOString().slice(0, 19));
+      setExperiment(experiment);
+      setExperimentDraft(experiment);
+      setSource(next.source);
+      setTarget(next.target);
+      setSelected(null);
+      setTracking(false);
+      setPlaying(false);
+      setHome((v) => v + 1);
+      setLoadedScenario(next);
+      setInputError("");
+    } catch (e) {
+      setInputError(e instanceof Error ? e.message : String(e));
+    }
+  }
+  function endpoint(source: number, target: number) {
+    setSource(source);
+    setTarget(target);
+    setLoadedScenario(null);
+    setPreviewId("");
+  }
   const snapshot = {
     ...telemetry,
     seconds: (frame?.timeUs ?? 0) / SECOND,
@@ -66,6 +125,11 @@ export default function App() {
     length: frame?.length ?? 0,
     links: frame?.physicalLinkCount ?? 0,
   };
+  const draftPreset = PRESETS.findIndex((p) =>
+    (["planes", "perPlane", "altitude", "inclination", "phase"] as const).every(
+      (key) => p.config[key] === draft[key],
+    ),
+  );
   const edgeOptions = useMemo(
     () => mesh(config).map(([a, b]) => edgeId(a, b)),
     [config],
@@ -96,7 +160,23 @@ export default function App() {
         computeDelayUs: Math.round(experimentDraft.computeMs * 1000),
         installDelayUs: Math.round(experimentDraft.installMs * 1000),
         seed: experimentDraft.seed,
+        notificationDelayUs: Math.round(experimentDraft.notificationMs * 1000),
+        switchDelayUs: Math.round(experimentDraft.switchMs * 1000),
       });
+      if (loadedScenario)
+        setLoadedScenario({
+          ...scenario,
+          epochMs,
+          durationUs: Math.round(experimentDraft.durationSeconds * SECOND),
+          slsIntervalUs: Math.round(experimentDraft.slsMs * 1000),
+          computeDelayUs: Math.round(experimentDraft.computeMs * 1000),
+          installDelayUs: Math.round(experimentDraft.installMs * 1000),
+          seed: experimentDraft.seed,
+          notificationDelayUs: Math.round(
+            experimentDraft.notificationMs * 1000,
+          ),
+          switchDelayUs: Math.round(experimentDraft.switchMs * 1000),
+        });
       setStartMs(epochMs);
       setExperiment({ ...experimentDraft });
       setInputError("");
@@ -116,6 +196,7 @@ export default function App() {
       setInputError(message);
       return;
     }
+    setLoadedScenario(null);
     setConfig({ ...draft });
     setSelected(null);
     setTracking(false);
@@ -189,11 +270,14 @@ export default function App() {
               프리셋
               <select
                 aria-label="성좌 프리셋"
-                defaultValue="0"
+                value={String(draftPreset)}
                 onChange={(e) =>
                   setDraft({ ...PRESETS[Number(e.target.value)].config })
                 }
               >
+                <option value="-1" disabled>
+                  사용자 설정
+                </option>
                 {PRESETS.map((p, i) => (
                   <option key={p.name} value={i}>
                     {i === 0 ? "기본 · 72기" : "Starlink S1 · 1,584기"}
@@ -274,6 +358,8 @@ export default function App() {
                     ["slsMs", "SLS 간격", "ms"],
                     ["computeMs", "계산 지연", "ms"],
                     ["installMs", "설치 지연", "ms"],
+                    ["notificationMs", "통지 지연", "ms"],
+                    ["switchMs", "예비 전환 지연", "ms"],
                     ["seed", "시드", ""],
                   ] as const
                 ).map(([key, label, unit]) => (
@@ -346,8 +432,59 @@ export default function App() {
                   결과 저장
                 </button>
               </div>
+              <label className="field">
+                시나리오 가져오기
+                <input
+                  type="file"
+                  accept=".json,application/json"
+                  aria-label="시나리오 가져오기"
+                  onChange={(e) => {
+                    const input = e.currentTarget;
+                    const file = input.files?.[0];
+                    if (file)
+                      void importScenario(file).finally(() => {
+                        input.value = "";
+                      });
+                  }}
+                />
+              </label>
+              <label className="field">
+                라우팅 알고리즘
+                <select
+                  aria-label="라우팅 알고리즘"
+                  value={scenario.routing.algorithm}
+                  onChange={(e) =>
+                    updateRouting({
+                      ...scenario.routing,
+                      algorithm: e.target.value as RoutingSettings["algorithm"],
+                    })
+                  }
+                >
+                  <option value="bfs">BFS · 최단 홉</option>
+                  <option value="candidate-paths">
+                    수동 후보 · MCSR 미적용
+                  </option>
+                </select>
+              </label>
+              <label className="field">
+                서비스 유형
+                <select
+                  aria-label="서비스 유형"
+                  value={scenario.routing.service}
+                  onChange={(e) =>
+                    updateRouting({
+                      ...scenario.routing,
+                      service: e.target.value as RoutingSettings["service"],
+                    })
+                  }
+                >
+                  <option value="LS">LS · 지연 우선</option>
+                  <option value="TS">TS · 가용 버퍼 우선</option>
+                  <option value="HR">HR · J &lt; 15ms, 버퍼 우선</option>
+                </select>
+              </label>
               <p className="model-caption">
-                SLS 3회 누락 감지 · 고정 처리시간 모델
+                SLS 3회 누락 감지 · 설정 지연 모델
                 <br />
                 시드 예약값 · 현재 난수 생성 미사용
               </p>
@@ -393,6 +530,7 @@ export default function App() {
               onPick={setSelected}
               onTelemetry={setTelemetry}
               onPickLink={setSelectedLink}
+              previewPath={preview?.nodes ?? []}
               onError={setError}
             />
           </div>
@@ -450,7 +588,7 @@ export default function App() {
                   <select
                     aria-label="출발 노드"
                     value={source}
-                    onChange={(e) => setSource(Number(e.target.value))}
+                    onChange={(e) => endpoint(Number(e.target.value), target)}
                   >
                     {nodes}
                   </select>
@@ -459,7 +597,9 @@ export default function App() {
                   disabled={selected === null}
                   title="선택 위성을 출발 노드로"
                   aria-label="선택 위성을 출발 노드로"
-                  onClick={() => selected !== null && setSource(selected)}
+                  onClick={() =>
+                    selected !== null && endpoint(selected, target)
+                  }
                 >
                   지정
                 </button>
@@ -471,7 +611,7 @@ export default function App() {
                   <select
                     aria-label="도착 노드"
                     value={target}
-                    onChange={(e) => setTarget(Number(e.target.value))}
+                    onChange={(e) => endpoint(source, Number(e.target.value))}
                   >
                     {nodes}
                   </select>
@@ -480,7 +620,9 @@ export default function App() {
                   disabled={selected === null}
                   title="선택 위성을 도착 노드로"
                   aria-label="선택 위성을 도착 노드로"
-                  onClick={() => selected !== null && setTarget(selected)}
+                  onClick={() =>
+                    selected !== null && endpoint(source, selected)
+                  }
                 >
                   지정
                 </button>
@@ -542,8 +684,116 @@ export default function App() {
                 title="MCSR 미적용. 패킷 이동 속도는 실제 전송 속도와 다릅니다."
                 aria-label="최단 홉 시각화. MCSR 미적용. 패킷 이동 속도는 실제 전송 속도와 다릅니다."
               >
-                최단 홉 · 시각화
+                {frame?.routingAlgorithm === "BFS"
+                  ? "최단 홉 · 시각화"
+                  : "수동 후보 · 시각화"}
               </span>
+            </section>
+            <section
+              className="panel-section routing-analysis"
+              aria-label="라우팅 판단"
+            >
+              <h2>경로 후보</h2>
+              <p className="model-caption">
+                {frame
+                  ? (
+                      {
+                        pending: "계산·설치 대기",
+                        installed: "설치 완료",
+                        retained: "기존 경로 유지",
+                        discarded: "입력 변경으로 폐기",
+                      } as const
+                    )[frame.routingAnalysis.status]
+                  : "대기"}
+              </p>
+              <p className="model-caption">
+                {frame?.routingAnalysis.mode === "reserve"
+                  ? "저장 후보 재사용"
+                  : frame?.routingAnalysis.mode === "recalculate"
+                    ? "후보 재계산"
+                    : "초기 계산"}{" "}
+                · {scenario.routing.service}
+                {frame
+                  ? ` · ${(frame.routingAnalysis.atUs / SECOND).toFixed(3)}초`
+                  : ""}
+              </p>
+              {frame?.routingAnalysis.candidates.map((c) => (
+                <button
+                  className={
+                    "candidate-row " + (previewId === c.id ? "active" : "")
+                  }
+                  key={c.id}
+                  aria-pressed={previewId === c.id}
+                  onClick={() => setPreviewId(previewId === c.id ? "" : c.id)}
+                >
+                  <strong>{c.nodes.join(" → ")}</strong>
+                  <span>
+                    {
+                      (
+                        {
+                          selected: "선택",
+                          eligible: "예비",
+                          dominated: "속성 열위",
+                          "jitter-limit": "지터 제한 초과",
+                          unavailable: "링크 사용 불가",
+                        } as const
+                      )[c.status]
+                    }
+                  </span>
+                  <small>
+                    {c.metrics
+                      ? `${c.metrics.propagationDelayMs.toFixed(2)} ms · ${(c.metrics.availableBufferRatio * 100).toFixed(1)}% · J ${c.metrics.jitterMs.toFixed(2)} ms`
+                      : "—"}
+                  </small>
+                  <small>
+                    {c.status === "selected"
+                      ? `${scenario.routing.service} 선택 기준`
+                      : c.status === "dominated"
+                        ? `우세 후보 ${c.reason.replace("dominated by ", "").replaceAll(":", " → ")}`
+                        : c.status === "jitter-limit"
+                          ? "J < 15 ms 조건 불충족"
+                          : c.status === "unavailable"
+                            ? "인지된 링크 상태로 제외"
+                            : "전환 가능 후보"}
+                  </small>
+                </button>
+              ))}
+              {!frame?.routingAnalysis.candidates.length && (
+                <p className="model-caption">사용 가능한 후보 없음</p>
+              )}
+              <details className="routing-stages">
+                <summary>복구·계산 단계</summary>
+                <ol className="event-list">
+                  {frame?.routingStages.map((e, i) => (
+                    <li key={i}>
+                      {(e.atUs / SECOND).toFixed(6)}초 ·{" "}
+                      {(
+                        {
+                          "notification-started": "통지 시작",
+                          "notification-completed": "통지 완료",
+                          "notification-discarded": "통지 취소",
+                          "route-decision": "후보 선택",
+                          "route-started": "재계산 시작",
+                          "route-computed": "재계산 완료",
+                          "reserve-switch-started": "예비 전환 시작",
+                          "reserve-switch-ready": "예비 전환 준비",
+                          "route-install-started": "설치 시작",
+                          "route-installed": "설치 완료",
+                          "route-discarded": "작업 폐기",
+                          "route-retained": "기존 경로 유지",
+                          "link-detected-down": "장애 감지",
+                          "link-detected-up": "복구 인지",
+                        } as Record<string, string>
+                      )[e.type] ?? e.type}
+                    </li>
+                  ))}
+                </ol>
+              </details>
+              {preview && (
+                <p className="model-caption">
+                  파란 선: 검토 후보 · 설치 경로와 별도
+                </p>
+              )}
             </section>
             <section className="panel-section failure-panel">
               <h2>링크 장애</h2>
@@ -817,7 +1067,7 @@ export default function App() {
             type="range"
             min="0"
             max={scenario.durationUs / SECOND}
-            step="1"
+            step="0.001"
             value={snapshot.seconds}
             onChange={(e) => jump(Number(e.target.value))}
           />

@@ -5,6 +5,10 @@ export type RecordEntry = {
   path?: number[];
   version?: number;
   outageId?: number;
+  decisionId?: number;
+  inputRevision?: number;
+  reason?: string;
+  mode?: "initial" | "reserve" | "recalculate";
 };
 export type LinkFailure = {
   id: number;

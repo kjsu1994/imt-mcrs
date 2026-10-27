@@ -77,7 +77,7 @@ test("Worker results match headless replay with normal and throttled rendering",
     const exported = JSON.parse(
       await readFile((await download.path())!, "utf8"),
     );
-    expect(exported.scenario.schemaVersion).toBe(3);
+    expect(exported.scenario.schemaVersion).toBe(4);
     await expect(
       page.getByLabel("현재 경로 속성", { exact: true }),
     ).toContainText("100.0 %");

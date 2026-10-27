@@ -1,8 +1,19 @@
-import { mesh, positions, activeEdges, pathLength, validate } from "./model";
+import {
+  mesh,
+  positions,
+  activeEdges,
+  pathLength,
+  validate,
+  distance,
+} from "./model";
 import type { Config } from "./model";
 import { MetricsEngine } from "./metrics";
 import {
-  bfsStrategy,
+  createRoutingStrategy,
+  validateCandidates,
+  pathProblem,
+  analyseCandidates,
+  candidateId,
   DEFAULT_LINK_LOAD,
   linkMetrics,
   evaluatePath,
@@ -13,14 +24,16 @@ import type {
   RoutingGraph,
   RoutingStrategy,
   PathCandidate,
+  RoutingSettings,
+  RoutingAnalysis,
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "link-attributes-v3";
+export const MODEL_VERSION = "routing-runtime-v4";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   config: Config;
   epochMs: number;
   durationUs: number;
@@ -32,6 +45,9 @@ export type Scenario = {
   installDelayUs: number;
   failures: FailureEvent[];
   linkMetricUpdates: LinkMetricUpdate[];
+  routing: RoutingSettings;
+  notificationDelayUs: number;
+  switchDelayUs: number;
 };
 export type LinkState = {
   id: string;
@@ -50,7 +66,7 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     config: { ...config },
     epochMs,
     durationUs: 86400 * SECOND,
@@ -62,17 +78,35 @@ export function createScenario(
     installDelayUs: 1000,
     failures: [],
     linkMetricUpdates: [],
+    routing: { algorithm: "bfs", service: "LS", candidatePaths: [] },
+    notificationDelayUs: 0,
+    switchDelayUs: 0,
   };
 }
 export function normalizeScenario(input: unknown): Scenario {
   if (!input || typeof input !== "object")
     throw new Error("시나리오 형식이 올바르지 않습니다.");
   const version = (input as { schemaVersion?: number }).schemaVersion;
-  if (version !== undefined && version !== 1 && version !== 2 && version !== 3)
+  if (
+    version !== undefined &&
+    version !== 1 &&
+    version !== 2 &&
+    version !== 3 &&
+    version !== 4
+  )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 3 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 4 } as Scenario;
   if (version !== 3 && scenario.linkMetricUpdates === undefined)
     scenario.linkMetricUpdates = [];
+  if (version !== 4) {
+    scenario.routing ??= {
+      algorithm: "bfs",
+      service: "LS",
+      candidatePaths: [],
+    };
+    scenario.notificationDelayUs ??= 0;
+    scenario.switchDelayUs ??= 0;
+  }
   validateScenario(scenario);
   return scenario;
 }
@@ -86,12 +120,14 @@ export type TopologyDelta = {
   version: number;
   changedLinks: LinkChange[];
   route?: { path: number[]; pathValid: boolean };
+  analysis?: RoutingAnalysis;
 };
 export type RenderCheckpoint = {
   timeUs: number;
   stateRevision: number;
   version: number;
   links: LinkState[];
+  analysis: RoutingAnalysis;
   path: number[];
   pathValid: boolean;
 };
@@ -102,7 +138,7 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 3)
+  if (s.schemaVersion !== 4)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
@@ -118,6 +154,29 @@ export function validateScenario(s: Scenario) {
   integer(s.installDelayUs, 0, s.durationUs, "설치 지연");
   if (!Array.isArray(s.failures))
     throw new Error("장애 일정은 배열이어야 합니다.");
+  integer(s.notificationDelayUs, 0, s.durationUs, "인지 후 통지 지연");
+  integer(s.switchDelayUs, 0, s.durationUs, "예비 전환 지연");
+  if (
+    !s.routing ||
+    !["bfs", "candidate-paths"].includes(s.routing.algorithm) ||
+    !["LS", "TS", "HR"].includes(s.routing.service) ||
+    !Array.isArray(s.routing.candidatePaths)
+  )
+    throw new Error("잘못된 라우팅 설정입니다.");
+  const structuralGraph: RoutingGraph = {
+    nodeCount: s.config.planes * s.config.perPlane,
+    links: mesh(s.config).map(([a, b]) => ({
+      id: edgeId(a, b),
+      sourceId: a,
+      targetId: b,
+      knownAvailable: true,
+      metrics: { propagationDelayMs: 0, availableBufferRatio: 1, jitterMs: 0 },
+    })),
+  };
+  for (const nodes of s.routing.candidatePaths) {
+    const problem = pathProblem(nodes, structuralGraph, s.source, s.target);
+    if (problem) throw new Error(`잘못된 수동 후보: ${problem}`);
+  }
   const ids = new Set(mesh(s.config).map(([a, b]) => edgeId(a, b))),
     seen = new Set<string>();
   for (const e of s.failures) {
@@ -216,9 +275,21 @@ export class SimulationEngine {
   } | null = null;
   private routingEvaluations: {
     evaluatedUs: number;
+    inputRevision: number;
     candidates: PathCandidate[];
   }[] = [];
+  private strategy: RoutingStrategy;
+  private inputRevision = 0;
+  private requestAtUs = -1;
   private requestedVersion = -1;
+  private pendingTrigger = "";
+  private cachedCandidates: PathCandidate[] = [];
+  private analyses: RoutingAnalysis[] = [];
+  private analysis!: RoutingAnalysis;
+  private committedAnalysisKey = "";
+  private previousDelays: number[] = [];
+  private delayChanged = false;
+  private routingReasons = new Set<string>();
   private physicalCommitUs = -1;
   private dirtyLinks = new Set<string>();
   private detectedLinks = new Set<string>();
@@ -227,12 +298,10 @@ export class SimulationEngine {
   private committedValid = false;
   private stateRevision = 0;
   private deltas: TopologyDelta[] = [];
-  constructor(
-    input: unknown,
-    private readonly strategy: RoutingStrategy = bfsStrategy,
-  ) {
+  constructor(input: unknown, strategy?: RoutingStrategy) {
     const scenario = normalizeScenario(input);
     this.scenario = scenario;
+    this.strategy = strategy ?? createRoutingStrategy(scenario.routing);
     this.metrics = new MetricsEngine(scenario.source, scenario.target);
     this.edges = mesh(scenario.config);
     this.geometric = this.geometry(0);
@@ -245,15 +314,29 @@ export class SimulationEngine {
           queuedPackets: e.queuedPackets,
           jitterMs: e.jitterMs,
         });
+        if (e.atUs > 0) {
+          this.metrics.record({
+            atUs: this.nowUs,
+            type: "link-metrics-changed",
+            linkId: e.linkId,
+          });
+          if (
+            this.strategy.reactsToMetrics !== false ||
+            scenario.routing.service === "HR"
+          )
+            this.inputsChanged("metrics");
+        }
       };
       if (e.atUs === 0) apply();
       else this.schedule(e.atUs, 1, apply);
     }
     const initial = this.calculate();
-    this.installed = initial.candidates[0]?.nodes ?? [];
+    this.cachedCandidates = initial.candidates;
+    const chosen = this.decide(initial.candidates, "initial", "initial");
+    this.installed = chosen?.nodes ?? [];
     this.installedEvaluation = {
       evaluatedUs: initial.evaluatedUs,
-      candidate: initial.candidates[0] ?? null,
+      candidate: chosen,
     };
     this.metrics.record({
       atUs: 0,
@@ -272,6 +355,7 @@ export class SimulationEngine {
         forced: false,
       });
     }
+    this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
     this.committedPath = this.installed.join(":");
     this.committedValid = this.validPath();
     this.observeService();
@@ -288,6 +372,15 @@ export class SimulationEngine {
       atUs / SECOND,
       this.scenario.epochMs,
     );
+    const delays = this.edges.map(
+      ([a, b]) => (distance(p[a], p[b]) / 299792458) * 1000,
+    );
+    this.delayChanged = delays.some(
+      (d, i) =>
+        Math.abs(d - (this.previousDelays[i] ?? d)) >
+        1e-9 * Math.max(1, Math.abs(d)),
+    );
+    this.previousDelays = delays;
     return new Set(activeEdges(this.edges, p).map(([a, b]) => edgeId(a, b)));
   }
   private scheduleTopology(atUs: number) {
@@ -295,6 +388,12 @@ export class SimulationEngine {
       const next = this.geometry(this.nowUs);
       this.geometric = next;
       this.stagePhysical();
+      if (
+        (this.strategy.reactsToMetrics !== false ||
+          this.scenario.routing.service === "HR") &&
+        this.delayChanged
+      )
+        this.inputsChanged("geometry-metrics");
       this.scheduleTopology(this.nowUs + SECOND);
     });
   }
@@ -379,17 +478,24 @@ export class SimulationEngine {
       pathValid = this.validPath();
     const routeChanged =
       path !== this.committedPath || pathValid !== this.committedValid;
-    if (changedLinks.length || routeChanged) {
+    const analysisChanged =
+      `${this.analysis.id}:${this.analysis.status}` !==
+      this.committedAnalysisKey;
+    if (changedLinks.length || routeChanged || analysisChanged) {
       this.deltas.push({
         timeUs: this.nowUs,
         stateRevision: ++this.stateRevision,
         version: this.version,
         changedLinks,
+        ...(analysisChanged
+          ? { analysis: structuredClone(this.analysis) }
+          : {}),
         ...(routeChanged
           ? { route: { path: [...this.installed], pathValid } }
           : {}),
       });
     }
+    this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
     this.committedPath = path;
     this.committedValid = pathValid;
   }
@@ -404,16 +510,24 @@ export class SimulationEngine {
       stateRevision: this.stateRevision,
       version: this.version,
       links: structuredClone([...this.committedLinks.values()]),
+      analysis: structuredClone(this.analysis),
       path: [...this.installed],
       pathValid: this.validPath(),
     };
   }
   private validPath() {
+    const nodes = this.installed;
     return (
-      this.installed.length > 0 &&
-      this.installed.every(
+      nodes.length > 0 &&
+      nodes[0] === this.scenario.source &&
+      nodes.at(-1) === this.scenario.target &&
+      new Set(nodes).size === nodes.length &&
+      nodes.every(
         (v, i) =>
-          i === 0 || this.physical.has(edgeId(this.installed[i - 1], v)),
+          Number.isInteger(v) &&
+          v >= 0 &&
+          v < this.scenario.config.planes * this.scenario.config.perPlane &&
+          (i === 0 || this.physical.has(edgeId(nodes[i - 1], v))),
       )
     );
   }
@@ -441,17 +555,7 @@ export class SimulationEngine {
       if (this.tokens.get(id) !== token) return;
       if (this.physical.has(id)) {
         this.missed.set(id, 0);
-        if (!this.known.has(id)) {
-          this.known.add(id);
-          this.dirtyLinks.add(id);
-          this.version++;
-          this.metrics.record({
-            atUs: this.nowUs,
-            type: "link-detected-up",
-            linkId: id,
-          });
-          this.requestRoute();
-        }
+        if (!this.known.has(id)) this.notifyLink(id, true, token);
       } else {
         const misses = (this.missed.get(id) ?? 0) + 1;
         this.missed.set(id, misses);
@@ -461,12 +565,10 @@ export class SimulationEngine {
           linkId: id,
         });
         if (misses >= 3) {
-          if (this.known.delete(id)) {
-            this.version++;
-            this.dirtyLinks.add(id);
+          if (this.known.has(id)) {
             this.detectedLinks.add(id);
             this.metrics.detected(this.nowUs, id);
-            this.requestRoute();
+            this.notifyLink(id, false, token);
           }
         } else
           this.scheduleHeartbeat(
@@ -475,6 +577,39 @@ export class SimulationEngine {
             this.nowUs + this.scenario.slsIntervalUs,
           );
       }
+    });
+  }
+  private notifyLink(id: string, up: boolean, token: number) {
+    this.metrics.record({
+      atUs: this.nowUs,
+      type: "notification-started",
+      linkId: id,
+    });
+    this.schedule(this.nowUs + this.scenario.notificationDelayUs, 2.25, () => {
+      if (this.tokens.get(id) !== token) {
+        this.metrics.record({
+          atUs: this.nowUs,
+          type: "notification-discarded",
+          linkId: id,
+        });
+        return;
+      }
+      if (this.known.has(id) === up) return;
+      if (up) this.known.add(id);
+      else this.known.delete(id);
+      this.dirtyLinks.add(id);
+      this.version++;
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: up ? "link-detected-up" : "link-known-down",
+        linkId: id,
+      });
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "notification-completed",
+        linkId: id,
+      });
+      this.inputsChanged(up ? "link-up" : "link-down");
     });
   }
   private networkLink(
@@ -518,63 +653,213 @@ export class SimulationEngine {
   private calculate() {
     const graph = this.graph();
     const started = performance.now();
-    const candidates = this.strategy.calculate(
-      graph,
-      this.scenario.source,
-      this.scenario.target,
-    );
+    let candidates: PathCandidate[];
+    try {
+      const raw = this.strategy.calculate(
+        structuredClone(graph),
+        this.scenario.source,
+        this.scenario.target,
+      );
+      candidates = validateCandidates(
+        raw,
+        graph,
+        this.scenario.source,
+        this.scenario.target,
+      );
+      if (raw.length !== candidates.length)
+        this.metrics.record({
+          atUs: this.nowUs,
+          type: "candidate-duplicates-removed",
+        });
+    } catch (error) {
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "routing-validation-failed",
+      });
+      throw error;
+    }
     this.profiling.push({
       atUs: this.nowUs,
       wallMs: performance.now() - started,
     });
     const evaluation = {
       evaluatedUs: this.nowUs,
+      inputRevision: this.inputRevision,
       candidates: structuredClone(candidates),
     };
     this.routingEvaluations.push(evaluation);
     return evaluation;
   }
-  private requestRoute() {
-    if (this.requestedVersion === this.version) return;
-    const version = this.version;
-    this.requestedVersion = version;
-    this.metrics.record({ atUs: this.nowUs, type: "route-started", version });
-    const evaluation = this.calculate();
-    const candidate = evaluation.candidates[0]?.nodes ?? [];
-    this.schedule(this.nowUs + this.scenario.computeDelayUs, 3, () => {
-      if (version !== this.version) {
-        this.metrics.record({
-          atUs: this.nowUs,
-          type: "route-discarded",
-          version,
-        });
-        return;
+  private decide(
+    candidates: PathCandidate[],
+    mode: RoutingAnalysis["mode"],
+    trigger: string,
+    unavailable: PathCandidate[] = [],
+  ): PathCandidate | null {
+    const { selected, decisions } = analyseCandidates(
+      candidates,
+      this.scenario.routing.service,
+    );
+    for (const c of unavailable)
+      decisions.push({
+        id: candidateId(c.nodes),
+        nodes: [...c.nodes],
+        metrics: null,
+        status: "unavailable",
+        reason: "known-link-unavailable",
+      });
+    this.analysis = {
+      status: mode === "initial" ? "installed" : "pending",
+      id: this.analyses.length + 1,
+      atUs: this.nowUs,
+      inputRevision: this.inputRevision,
+      algorithm: this.strategy.name,
+      service: this.scenario.routing.service,
+      mode,
+      trigger,
+      selectedId: selected ? candidateId(selected.nodes) : null,
+      candidates: decisions,
+    };
+    this.analyses.push(structuredClone(this.analysis));
+    this.metrics.record({
+      atUs: this.nowUs,
+      type: "route-decision",
+      decisionId: this.analysis.id,
+      inputRevision: this.inputRevision,
+      reason: trigger,
+      mode,
+      path: selected?.nodes ?? [],
+    });
+    return selected;
+  }
+  private decisionStatus(id: number, status: RoutingAnalysis["status"]) {
+    this.analyses[id - 1].status = status;
+    if (this.analysis.id === id) this.analysis.status = status;
+  }
+  private inputsChanged(reason: string) {
+    this.inputRevision++;
+    this.routingReasons.add(reason);
+    if (this.requestAtUs === this.nowUs) return;
+    this.requestAtUs = this.nowUs;
+    this.schedule(this.nowUs, 2.5, () => {
+      const trigger = [...this.routingReasons].sort().join(",");
+      this.routingReasons.clear();
+      this.requestRoute(trigger);
+    });
+  }
+  private requestRoute(trigger: string) {
+    if (this.requestedVersion === this.inputRevision) return;
+    this.requestedVersion = this.inputRevision;
+    const revision = this.inputRevision,
+      version = this.version;
+    const graph = this.graph();
+    let evaluation: { evaluatedUs: number; candidates: PathCandidate[] };
+    let mode: RoutingAnalysis["mode"] = "recalculate";
+    let unavailable: PathCandidate[] = [];
+    if (trigger === "link-down") {
+      const available: PathCandidate[] = [];
+      for (const c of this.cachedCandidates) {
+        const refreshed = evaluatePath(c.nodes, graph.links);
+        if (refreshed) available.push(refreshed);
+        else unavailable.push(c);
       }
+      if (
+        analyseCandidates(available, this.scenario.routing.service).selected
+      ) {
+        mode = "reserve";
+        evaluation = { evaluatedUs: this.nowUs, candidates: available };
+      } else evaluation = this.calculate();
+    } else evaluation = this.calculate();
+    const selected = this.decide(
+      evaluation.candidates,
+      mode,
+      trigger,
+      unavailable,
+    );
+    const decisionId = this.analysis.id;
+    const path = selected?.nodes ?? [];
+    const stale = () => revision !== this.inputRevision;
+    const discard = () => {
+      this.decisionStatus(decisionId, "discarded");
       this.metrics.record({
         atUs: this.nowUs,
-        type: "route-computed",
+        type: "route-discarded",
         version,
-        path: candidate,
+        inputRevision: revision,
+        decisionId,
+        reason: "input-revision-changed",
+        mode,
+      });
+    };
+    if (mode === "reserve" && path.join(":") === this.installed.join(":")) {
+      this.decisionStatus(decisionId, "retained");
+      this.cachedCandidates = structuredClone(evaluation.candidates);
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "route-retained",
+        decisionId,
+        inputRevision: revision,
+        mode,
+        path,
+      });
+      return;
+    }
+    this.metrics.record({
+      atUs: this.nowUs,
+      type: mode === "reserve" ? "reserve-switch-started" : "route-started",
+      version,
+      inputRevision: revision,
+      decisionId,
+      mode,
+      reason: trigger,
+    });
+    const delay =
+      mode === "reserve"
+        ? this.scenario.switchDelayUs
+        : this.scenario.computeDelayUs;
+    this.schedule(this.nowUs + delay, 3, () => {
+      if (stale()) {
+        discard();
+        return;
+      }
+      this.cachedCandidates = structuredClone(evaluation.candidates);
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: mode === "reserve" ? "reserve-switch-ready" : "route-computed",
+        version,
+        inputRevision: revision,
+        decisionId,
+        mode,
+        path,
+      });
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "route-install-started",
+        version,
+        inputRevision: revision,
+        decisionId,
+        mode,
+        path,
       });
       this.schedule(this.nowUs + this.scenario.installDelayUs, 4, () => {
-        if (version !== this.version) {
-          this.metrics.record({
-            atUs: this.nowUs,
-            type: "route-discarded",
-            version,
-          });
+        if (stale()) {
+          discard();
           return;
         }
-        this.installed = [...candidate];
+        this.decisionStatus(decisionId, "installed");
+        this.installed = [...path];
         this.installedEvaluation = {
           evaluatedUs: evaluation.evaluatedUs,
-          candidate: structuredClone(evaluation.candidates[0] ?? null),
+          candidate: structuredClone(selected),
         };
         this.metrics.record({
           atUs: this.nowUs,
           type: "route-installed",
           version,
-          path: candidate,
+          inputRevision: revision,
+          decisionId,
+          mode,
+          path,
         });
       });
     });
@@ -620,7 +905,14 @@ export class SimulationEngine {
       pathValid: this.validPath(),
       length: pathLength(this.installed, p),
       routingAlgorithm: this.strategy.name,
+      routingAnalysis: structuredClone(this.analysis),
       currentPathMetrics: this.currentPathMetrics(p),
+      routingStages: this.metrics.events
+        .slice(-24)
+        .filter((e) =>
+          /notification|route-|reserve-|link-detected/.test(e.type),
+        )
+        .slice(-8),
       installedEvaluation: structuredClone(this.installedEvaluation),
       physicalLinkCount: this.physical.size,
       ...this.metrics.summary(
@@ -642,6 +934,14 @@ export class SimulationEngine {
       modelVersion: MODEL_VERSION,
       routingAlgorithm: this.strategy.name,
       routingEvaluations: structuredClone(this.routingEvaluations),
+      routingAnalyses: structuredClone(this.analyses),
+      delayModel: {
+        kind: "configured-logical-delays",
+        notificationDelayUs: this.scenario.notificationDelayUs,
+        computeDelayUs: this.scenario.computeDelayUs,
+        switchDelayUs: this.scenario.switchDelayUs,
+        installDelayUs: this.scenario.installDelayUs,
+      },
       installedEvaluation: structuredClone(this.installedEvaluation),
       currentPathMetrics: this.currentPathMetrics(
         positions(

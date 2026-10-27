@@ -44,6 +44,7 @@ export class TopologyStream {
       this.received = {
         ...this.received,
         ...d.route,
+        ...(d.analysis ? { analysis: d.analysis } : {}),
         timeUs: d.timeUs,
         stateRevision: d.stateRevision,
         version: d.version,
@@ -57,6 +58,8 @@ export class TopologyStream {
       checkpoint.stateRevision !== this.received.stateRevision ||
       checkpoint.links.length !== this.latest.size ||
       checkpoint.version !== this.received.version ||
+      checkpoint.analysis.id !== this.received.analysis.id ||
+      checkpoint.analysis.status !== this.received.analysis.status ||
       checkpoint.pathValid !== this.received.pathValid ||
       checkpoint.path.join(":") !== this.received.path.join(":")
     )
@@ -84,6 +87,7 @@ export class TopologyStream {
       this.displayed = {
         ...this.displayed,
         ...d.route,
+        ...(d.analysis ? { analysis: d.analysis } : {}),
         stateRevision: d.stateRevision,
         version: d.version,
       };
