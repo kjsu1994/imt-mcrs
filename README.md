@@ -24,7 +24,7 @@ npm.cmd run test:browser
 
 ## 조작
 
-- 지구본 드래그·휠로 회전·확대/축소. 중간 버튼 드래그로 기울이기.
+- 지구본 드래그로 극점 제한 없이 상하좌우 연속 회전, 휠·오른쪽 드래그로 확대/축소합니다. 일반 보기의 이동·기울이기는 제한하고, 위성 추적 해제 시에도 지구 중심을 유지합니다. 확대 범위는 지표 기준 약 250~50,000km입니다.
 - 위성 클릭 또는 위성 선택 목록으로 정보 확인. 위성 추적 / 전체 보기로 카메라 전환.
 - 출발·도착 위성을 고르면 초록색 경로와 노란색 패킷 흐름을 표시합니다. 동일 노드는 전송하지 않고, 연결되지 않으면 경로 없음으로 표시합니다.
 - 선택 위성을 통신 출발·도착 노드로 지정할 수 있습니다.
@@ -48,7 +48,7 @@ npm.cmd run test:browser
 
 ## 자산 출처
 
-`public/textures/earth.jpg`: Tom Patterson, Natural Earth III, Earth without clouds. 공개 배포 사본: https://github.com/turban/webgl-earth/blob/master/images/2_no_clouds_4k.jpg . 원 저작자: https://www.shadedrelief.com/natural3/ . Public domain 이용 조건: https://www.shadedrelief.com/natural3/pages/use.html . 화면 크레딧에도 출처를 표시합니다.
+`public/textures/earth.jpg`: Tom Patterson, Natural Earth III, Earth without clouds. 공개 배포 사본: https://github.com/turban/webgl-earth/blob/master/images/2_no_clouds_4k.jpg . 원 저작자: https://www.shadedrelief.com/natural3/ . Public domain 이용 조건: https://www.shadedrelief.com/natural3/pages/use.html . 출처와 라이선스는 이 문서에 보존하며, 로컬 공개 자산만 사용하므로 화면 크레딧은 숨깁니다.
 
 Cesium 로컬 리소스와 포함 라이선스는 설치 패키지에서 복사합니다. 온라인 지도·ion·지형·지오코더를 사용하지 않습니다. 검증 결과는 `VALIDATION.md`에 기록합니다.
 

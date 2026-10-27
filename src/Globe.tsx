@@ -18,8 +18,10 @@ import {
   Matrix4,
   Credit,
   EllipsoidTerrainProvider,
+  Transforms,
 } from "cesium";
 import {
+  EARTH_RADIUS,
   activeEdges,
   mesh,
   positions,
@@ -98,6 +100,18 @@ export default function Globe(props: Props) {
       viewer.scene.globe.enableLighting = false;
       viewer.scene.globe.showGroundAtmosphere = false;
       viewer.resolutionScale = Math.min(window.devicePixelRatio || 1, 1.5);
+      const controller = viewer.scene.screenSpaceCameraController;
+      viewer.camera.constrainedAxis = undefined;
+      controller.enableTranslate = false;
+      controller.enableTilt = false;
+      controller.enableLook = false;
+      const earthFrame = Transforms.eastNorthUpToFixedFrame(Cartesian3.ZERO);
+      const centerOnEarth = () => {
+        const camera = viewer!.camera;
+        // Keep the world position while switching from satellite tracking to an Earth-centered orbit.
+        camera.lookAtTransform(earthFrame);
+        camera.lookAtTransform(earthFrame, Cartesian3.clone(camera.position));
+      };
       const start = JulianDate.fromDate(new Date(props.startMs));
       viewer.clock.startTime = start.clone();
       viewer.clock.stopTime = JulianDate.addSeconds(
@@ -349,15 +363,23 @@ export default function Globe(props: Props) {
             destination: Cartesian3.fromDegrees(118, 18, 21000000),
             orientation: { heading: 0, pitch: -Math.PI / 2, roll: 0 },
           });
+          centerOnEarth();
           lastHome = p.home;
         }
+        const isTracking = p.tracking && p.selected !== null;
+        controller.minimumZoomDistance = isTracking
+          ? 10000
+          : EARTH_RADIUS + 250000;
+        controller.maximumZoomDistance = isTracking
+          ? 50000000
+          : EARTH_RADIUS + 50000000;
         if (p.tracking && p.selected !== null) {
           viewer.camera.lookAt(
             cart(pos[p.selected]),
             new HeadingPitchRange(0, -0.5, 1500000),
           );
         } else if (lastTrack) {
-          viewer.camera.lookAtTransform(Matrix4.IDENTITY);
+          centerOnEarth();
         }
         lastTrack = p.tracking;
         if (now - lastReport >= 250) {
