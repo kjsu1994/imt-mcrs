@@ -1,7 +1,8 @@
 import type {
   Scenario,
   FailureEvent,
-  SimulationFrame,
+  RenderCheckpoint,
+  TopologyDelta,
   SimulationEngine,
 } from "./engine";
 export type Command =
@@ -14,6 +15,7 @@ export type Command =
     }
   | { type: "play"; runId: number; playing: boolean; speed: number }
   | { type: "seek"; runId: number; nextRunId: number; atUs: number }
+  | { type: "resync"; runId: number }
   | { type: "step"; runId: number }
   | { type: "failure"; runId: number; event: FailureEvent; immediate?: boolean }
   | { type: "finish"; runId: number }
@@ -22,7 +24,18 @@ export type Reply =
   | {
       type: "state";
       runId: number;
-      frame: SimulationFrame;
+      progress: Omit<
+        ReturnType<SimulationEngine["progress"]>,
+        "serviceOutages" | "linkFailures"
+      >;
+      histories?: Pick<
+        ReturnType<SimulationEngine["progress"]>,
+        "serviceOutages" | "linkFailures"
+      >;
+      scenario?: Scenario;
+      deltas: TopologyDelta[];
+      checkpoint?: RenderCheckpoint;
+      reset: boolean;
       busy: boolean;
       playing: boolean;
     }

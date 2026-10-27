@@ -2,7 +2,13 @@ import { useState, useMemo, useEffect } from "react";
 import Globe from "./Globe";
 import type { Telemetry } from "./Globe";
 import { PRESETS, validate, period, mesh } from "./model";
-import { createScenario, validateScenario, SECOND, edgeId } from "./engine";
+import {
+  createScenario,
+  validateScenario,
+  SECOND,
+  edgeId,
+  DEFAULT_EPOCH_MS,
+} from "./engine";
 import { useSimulation } from "./useSimulation";
 const initial: Telemetry = { latitude: 0, longitude: 0, altitude: 0 };
 const defaultExperiment = {
@@ -15,7 +21,10 @@ const defaultExperiment = {
 export default function App() {
   const [config, setConfig] = useState(PRESETS[0].config),
     [draft, setDraft] = useState(config),
-    [startMs] = useState(() => Date.now()),
+    [startMs, setStartMs] = useState(DEFAULT_EPOCH_MS),
+    [utcDraft, setUtcDraft] = useState(
+      new Date(DEFAULT_EPOCH_MS).toISOString().slice(0, 19),
+    ),
     [playing, setPlaying] = useState(true),
     [speed, setSpeed] = useState(10),
     [selected, setSelected] = useState<number | null>(0),
@@ -55,16 +64,19 @@ export default function App() {
     seconds: (frame?.timeUs ?? 0) / SECOND,
     path: frame?.path ?? [],
     length: frame?.length ?? 0,
-    links: frame?.links.filter((l) => l.physical).length ?? 0,
+    links: frame?.physicalLinkCount ?? 0,
   };
   const edgeOptions = useMemo(
     () => mesh(config).map(([a, b]) => edgeId(a, b)),
     [config],
   );
   const linkOptions = useMemo(
-    () => edgeOptions.map((id) => (
-      <option key={id} value={id}>{id.replace(":", " ↔ ")}</option>
-    )),
+    () =>
+      edgeOptions.map((id) => (
+        <option key={id} value={id}>
+          {id.replace(":", " ↔ ")}
+        </option>
+      )),
     [edgeOptions],
   );
   const linkId = edgeOptions.includes(selectedLink)
@@ -75,14 +87,17 @@ export default function App() {
   }
   function applyExperiment() {
     try {
+      const epochMs = Date.parse(utcDraft + "Z");
       validateScenario({
         ...scenario,
+        epochMs,
         durationUs: Math.round(experimentDraft.durationSeconds * SECOND),
         slsIntervalUs: Math.round(experimentDraft.slsMs * 1000),
         computeDelayUs: Math.round(experimentDraft.computeMs * 1000),
         installDelayUs: Math.round(experimentDraft.installMs * 1000),
         seed: experimentDraft.seed,
       });
+      setStartMs(epochMs);
       setExperiment({ ...experimentDraft });
       setInputError("");
     } catch (e) {
@@ -242,6 +257,16 @@ export default function App() {
             </button>
             <section className="panel-section experiment-panel">
               <h2>실험</h2>
+              <label className="field">
+                시작 UTC
+                <input
+                  aria-label="시작 UTC"
+                  type="datetime-local"
+                  step="1"
+                  value={utcDraft}
+                  onChange={(e) => setUtcDraft(e.target.value)}
+                />
+              </label>
               <div className="field-grid">
                 {(
                   [
@@ -258,6 +283,12 @@ export default function App() {
                       <input
                         type="number"
                         aria-label={label}
+                        disabled={key === "seed"}
+                        title={
+                          key === "seed"
+                            ? "예약값 · 현재 난수 생성 미사용"
+                            : undefined
+                        }
                         value={
                           Number.isNaN(experimentDraft[key])
                             ? ""
@@ -317,6 +348,8 @@ export default function App() {
               </div>
               <p className="model-caption">
                 SLS 3회 누락 감지 · 고정 처리시간 모델
+                <br />
+                시드 예약값 · 현재 난수 생성 미사용
               </p>
             </section>
             <section className="panel-section">
@@ -346,6 +379,7 @@ export default function App() {
               config={config}
               startMs={startMs}
               frame={frame}
+              topology={simulation.topology}
               runId={simulation.runId}
               running={simulation.running}
               selectedLink={linkId}
@@ -551,26 +585,61 @@ export default function App() {
                   </ol>
                 </details>
               ) : null}
-              <h3>복구 기록</h3>
+              <h3>서비스 중단</h3>
+              <dl className="service-summary">
+                <div>
+                  <dt>중단 횟수</dt>
+                  <dd>{frame?.outageCount ?? 0}회</dd>
+                </div>
+                <div>
+                  <dt>누적 중단</dt>
+                  <dd>
+                    {((frame?.totalDowntimeUs ?? 0) / 1000).toFixed(3)} ms
+                  </dd>
+                </div>
+                <div>
+                  <dt>가용률</dt>
+                  <dd>
+                    {frame?.availability == null
+                      ? "—"
+                      : `${(frame.availability * 100).toFixed(4)}%`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>복구 완료 평균</dt>
+                  <dd>
+                    {frame?.meanOutageUs == null
+                      ? "—"
+                      : `${(frame.meanOutageUs / 1000).toFixed(3)} ms`}
+                  </dd>
+                </div>
+                <div>
+                  <dt>미복구 / 진행 중</dt>
+                  <dd>
+                    {frame?.unrecoveredCount ?? 0} / {frame?.pendingCount ?? 0}
+                  </dd>
+                </div>
+              </dl>
               <ul className="recovery-list">
-                {frame?.recoveries.length ? (
-                  frame.recoveries.slice(-6).map((r) => (
+                {frame?.serviceOutages.length ? (
+                  frame.serviceOutages.map((r) => (
                     <li key={r.id}>
                       <strong>
-                        {r.linkId}{" "}
-                        <small>{(r.failureUs / SECOND).toFixed(3)}초</small>
+                        중단 #{r.id}{" "}
+                        <small>{(r.startedUs / SECOND).toFixed(3)}초</small>
                       </strong>
                       <span>
-                        {r.status === "unaffected"
-                          ? "영향 없음"
-                          : r.status === "recovered"
-                            ? `${(r.recoveryUs! / 1000).toFixed(3)} ms`
-                            : r.status === "unrecovered"
-                              ? "미복구"
-                              : r.detectedUs === null
-                                ? "감지 대기"
-                                : "경로 수립 중"}
+                        {r.status === "recovered"
+                          ? `${(r.recoveryUs! / 1000).toFixed(3)} ms`
+                          : r.status === "unrecovered"
+                            ? "미복구"
+                            : "중단 중"}
                       </span>
+                      <small>
+                        {r.reason === "initial-unreachable"
+                          ? "초기 미연결"
+                          : `관련 링크 ${r.causeLinkIds.join(", ") || "—"}`}
+                      </small>
                       <small>
                         감지{" "}
                         {r.detectionUs === null
@@ -587,6 +656,29 @@ export default function App() {
                   <li>기록 없음</li>
                 )}
               </ul>
+              <details className="link-history">
+                <summary>링크 장애 이력 (최근 6건)</summary>
+                <ol className="event-list">
+                  {frame?.linkFailures.length ? (
+                    frame.linkFailures.map((r) => (
+                      <li key={r.id}>
+                        {r.linkId} · 단절 {(r.startedUs / SECOND).toFixed(3)}초
+                        <br />
+                        감지{" "}
+                        {r.detectedUs === null
+                          ? "—"
+                          : `${(r.detectedUs / SECOND).toFixed(3)}초`}{" "}
+                        · 물리 복구{" "}
+                        {r.restoredUs === null
+                          ? "—"
+                          : `${(r.restoredUs / SECOND).toFixed(3)}초`}
+                      </li>
+                    ))
+                  ) : (
+                    <li>기록 없음</li>
+                  )}
+                </ol>
+              </details>
             </section>
             <section className="panel-section">
               <h2>위성 정보</h2>
@@ -686,7 +778,7 @@ export default function App() {
           </select>
         </div>
         <div className="time-track">
-          <time>
+          <time title="논리 시각 기준입니다. 3D 화면은 약 0.1초 지연해 재생합니다.">
             {utc}
             <small> UTC</small>
           </time>
@@ -706,10 +798,13 @@ export default function App() {
               );
               const hours = scenario.durationUs >= 3600 * SECOND;
               const major = Math.floor(seconds / (hours ? 3600 : 60));
-              const minor = hours ? Math.floor(seconds / 60) % 60 : seconds % 60;
+              const minor = hours
+                ? Math.floor(seconds / 60) % 60
+                : seconds % 60;
               return (
                 <span key={i}>
-                  +{String(major).padStart(2, "0")}:{String(minor).padStart(2, "0")}
+                  +{String(major).padStart(2, "0")}:
+                  {String(minor).padStart(2, "0")}
                 </span>
               );
             })}

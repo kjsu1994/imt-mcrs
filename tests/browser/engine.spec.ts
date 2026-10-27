@@ -48,10 +48,20 @@ test("Worker results match headless replay with normal and throttled rendering",
     await page.getByLabel("선택 링크", { exact: true }).selectOption("0:1");
     await page.getByLabel("장애 예약 시각").fill("1");
     await page.getByRole("button", { name: "장애 예약", exact: true }).click();
-    await expect(page.locator(".failure-panel summary")).toContainText("1건");
+    await expect(
+      page.locator(".failure-panel details:not(.link-history) > summary"),
+    ).toContainText("1건");
     await page.getByLabel("장애 예약 시각").fill("2");
     await page.getByRole("button", { name: "복구 예약", exact: true }).click();
-    await expect(page.locator(".failure-panel summary")).toContainText("2건");
+    await expect(
+      page.locator(".failure-panel details:not(.link-history) > summary"),
+    ).toContainText("2건");
+    await page.getByLabel("선택 링크", { exact: true }).selectOption("1:2");
+    await page.getByLabel("장애 예약 시각").fill("1.05");
+    await page.getByRole("button", { name: "장애 예약", exact: true }).click();
+    await expect(
+      page.locator(".failure-panel details:not(.link-history) > summary"),
+    ).toContainText("3건");
     await page
       .getByRole("button", { name: "끝까지 실행", exact: true })
       .click();
@@ -63,6 +73,11 @@ test("Worker results match headless replay with normal and throttled rendering",
     const exported = JSON.parse(
       await readFile((await download.path())!, "utf8"),
     );
+    expect(exported.scenario.schemaVersion).toBe(2);
+    expect(exported.scenario.epochMs).toBe(Date.UTC(2026, 0, 1));
+    expect(exported.result.outageCount).toBe(1);
+    expect(exported.result.linkFailures).toHaveLength(2);
+    expect(exported.result.totalDowntimeUs).toBe(202000);
     const core = new SimulationEngine(exported.scenario);
     core.advanceTo(exported.scenario.durationUs);
     expect(exported.result).toEqual(core.result());
@@ -78,9 +93,38 @@ test("Worker results match headless replay with normal and throttled rendering",
     await page.getByLabel("재생 속도").selectOption("1");
     await page.getByRole("button", { name: "재생", exact: true }).click();
     await expect(page.locator(".run-status")).toHaveText("재생 중");
-    await expect.poll(async () => Number(await page.getByLabel("시뮬레이션 시간", { exact: true }).inputValue())).toBeGreaterThan(0);
+    await expect
+      .poll(async () =>
+        Number(
+          await page
+            .getByLabel("시뮬레이션 시간", { exact: true })
+            .inputValue(),
+        ),
+      )
+      .toBeGreaterThan(0);
     await page.getByRole("button", { name: "일시정지", exact: true }).click();
     expect(errors).toEqual([]);
     await page.close();
   }
+});
+
+test("UTC is fixed and editable while unused seed is explicitly reserved", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.locator(".run-status")).toHaveText("재생 중");
+  await page.getByRole("button", { name: "일시정지", exact: true }).click();
+  await expect(page.getByLabel("시작 UTC", { exact: true })).toHaveValue(
+    "2026-01-01T00:00",
+  );
+  await expect(page.getByLabel("시드", { exact: true })).toBeDisabled();
+  await page
+    .getByLabel("시작 UTC", { exact: true })
+    .fill("2026-02-02T03:04:05");
+  await page.getByRole("button", { name: "실험 적용", exact: true }).click();
+  await expect(page.locator("time")).toContainText("2026-02-02 03:04:05");
+  await page.getByLabel("시작 UTC", { exact: true }).fill("");
+  await page.getByRole("button", { name: "실험 적용", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("시작 시각");
+  await expect(page.locator("time")).toContainText("2026-02-02 03:04:05");
 });

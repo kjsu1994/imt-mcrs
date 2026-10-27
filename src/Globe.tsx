@@ -28,7 +28,8 @@ import {
   period,
 } from "./model";
 import type { Config, Vec3 } from "./model";
-import type { SimulationFrame } from "./engine";
+import type { SimulationFrame, RenderCheckpoint } from "./engine";
+import type { TopologyStream } from "./topologyStream";
 import { DisplayClock } from "./displayClock";
 export type Telemetry = {
   latitude: number;
@@ -39,6 +40,7 @@ type Props = {
   config: Config;
   startMs: number;
   frame: SimulationFrame | null;
+  topology: TopologyStream;
   runId: number;
   running: boolean;
   selectedLink: string;
@@ -155,7 +157,8 @@ export default function Globe(props: Props) {
         lastReport = 0,
         lastStyle = "",
         lastSelectedLink = "",
-        lastFrame: SimulationFrame | null = null,
+        lastFrame: RenderCheckpoint | null = null,
+        lastGeneration = -1,
         lastTrack = false,
         lastRunId = -1,
         lastClockFrame: SimulationFrame | null = null,
@@ -174,30 +177,69 @@ export default function Globe(props: Props) {
         )
           current.current.onPickLink(picked.id.slice(4));
       }, ScreenSpaceEventType.LEFT_CLICK);
-      handler.setInputAction(() => { dragging = true; }, ScreenSpaceEventType.LEFT_DOWN);
-      handler.setInputAction(() => { dragging = false; }, ScreenSpaceEventType.LEFT_UP);
-      const releaseDrag = () => { dragging = false; };
+      handler.setInputAction(() => {
+        dragging = true;
+      }, ScreenSpaceEventType.LEFT_DOWN);
+      handler.setInputAction(() => {
+        dragging = false;
+      }, ScreenSpaceEventType.LEFT_UP);
+      const releaseDrag = () => {
+        dragging = false;
+      };
       window.addEventListener("pointerup", releaseDrag);
       window.addEventListener("blur", releaseDrag);
       releaseRotation = () => {
         window.removeEventListener("pointerup", releaseDrag);
         window.removeEventListener("blur", releaseDrag);
       };
-      handler.setInputAction((movement: { startPosition: Cartesian2; endPosition: Cartesian2 }) => {
-        if (!dragging || current.current.tracking) return;
-        const camera = viewer!.camera, canvas = viewer!.scene.canvas;
-        const altitude = Math.max(0, Cartesian3.magnitude(camera.positionWC) - EARTH_RADIUS);
-        const sensitivity = Math.min(1, Math.max(0.01, altitude / 21000000));
-        camera.rotateRight((movement.startPosition.x - movement.endPosition.x) / canvas.clientWidth * Math.PI * 2 * 1.77 * sensitivity);
-        camera.rotateUp((movement.startPosition.y - movement.endPosition.y) / canvas.clientHeight * Math.PI * 1.77 * sensitivity);
-      }, ScreenSpaceEventType.MOUSE_MOVE);
+      handler.setInputAction(
+        (movement: { startPosition: Cartesian2; endPosition: Cartesian2 }) => {
+          if (!dragging || current.current.tracking) return;
+          const camera = viewer!.camera,
+            canvas = viewer!.scene.canvas;
+          const altitude = Math.max(
+            0,
+            Cartesian3.magnitude(camera.positionWC) - EARTH_RADIUS,
+          );
+          const sensitivity = Math.min(1, Math.max(0.01, altitude / 21000000));
+          camera.rotateRight(
+            ((movement.startPosition.x - movement.endPosition.x) /
+              canvas.clientWidth) *
+              Math.PI *
+              2 *
+              1.77 *
+              sensitivity,
+          );
+          camera.rotateUp(
+            ((movement.startPosition.y - movement.endPosition.y) /
+              canvas.clientHeight) *
+              Math.PI *
+              1.77 *
+              sensitivity,
+          );
+        },
+        ScreenSpaceEventType.MOUSE_MOVE,
+      );
       const update = () => {
         if (!viewer || viewer.isDestroyed()) return;
         const p = current.current,
           now = performance.now();
-        if (lastClockFrame !== p.frame || lastRunId !== p.runId || lastRunning !== p.running) {
-          displayClock.receive(p.frame?.timeUs ?? 0, now,
-            p.running && lastRunning && lastRunId === p.runId && lastClockFrame !== null);
+        if (
+          lastClockFrame !== p.frame ||
+          lastRunId !== p.runId ||
+          lastRunning !== p.running ||
+          lastGeneration !== p.topology.generation
+        ) {
+          displayClock.receive(
+            p.frame?.timeUs ?? 0,
+            now,
+            p.running &&
+              lastRunning &&
+              lastRunId === p.runId &&
+              lastClockFrame !== null &&
+              lastGeneration === p.topology.generation,
+          );
+          lastGeneration = p.topology.generation;
           lastClockFrame = p.frame;
           lastRunId = p.runId;
           lastRunning = p.running;
@@ -209,7 +251,8 @@ export default function Globe(props: Props) {
           seconds,
           new JulianDate(),
         );
-        const path = p.frame?.path ?? [];
+        const display = p.frame ? p.topology.at(displayClock.at(now)) : null;
+        const path = display?.path ?? [];
         if (config !== p.config) {
           config = p.config;
           points.removeAll();
@@ -270,9 +313,9 @@ export default function Globe(props: Props) {
           }
         }
         lastStyle = styleKey;
-        if (lastFrame !== p.frame || lastSelectedLink !== p.selectedLink) {
+        if (lastFrame !== display || lastSelectedLink !== p.selectedLink) {
           const visibleLinks =
-            p.frame?.links.filter(
+            display?.links.filter(
               (link) =>
                 link.physical || link.forced || (link.known && !link.physical),
             ) ?? [];
@@ -287,7 +330,11 @@ export default function Globe(props: Props) {
             wireIds = [];
             for (const link of visibleLinks) {
               const groupIndex = Math.floor(wireIds.length / linesPerGroup);
-              const group = wireGroups[groupIndex] ?? (wireGroups[groupIndex] = viewer.scene.primitives.add(new PolylineCollection()) as PolylineCollection);
+              const group =
+                wireGroups[groupIndex] ??
+                (wireGroups[groupIndex] = viewer.scene.primitives.add(
+                  new PolylineCollection(),
+                ) as PolylineCollection);
               const line = group.add({
                 id: `isl:${link.id}`,
                 positions: [scenePositions[link.a], scenePositions[link.b]],
@@ -306,33 +353,40 @@ export default function Globe(props: Props) {
             }
             linkKey = nextLinkKey;
           }
-          lastFrame = p.frame;
+          lastFrame = display;
           lastSelectedLink = p.selectedLink;
         }
-        wireGroups.forEach((group) => { group.show = p.links; });
+        wireGroups.forEach((group) => {
+          group.show = p.links;
+        });
         // Every visible primitive uses the same interpolated display time.
         if (p.links) {
           for (let i = 0; i < wireIds.length; i++) {
             const [a, b] = wireIds[i];
-            wireGroups[Math.floor(i / linesPerGroup)].get(i % linesPerGroup).positions = [scenePositions[a], scenePositions[b]];
+            wireGroups[Math.floor(i / linesPerGroup)].get(
+              i % linesPerGroup,
+            ).positions = [scenePositions[a], scenePositions[b]];
           }
         }
         const key = path.join(":");
         if (key !== routeKey) {
           paths.removeAll();
           if (path.length > 1)
-            paths.add({ positions: path.map((id) => scenePositions[id]), width: 3 });
+            paths.add({
+              positions: path.map((id) => scenePositions[id]),
+              width: 3,
+            });
           routeKey = key;
         }
         if (paths.length) {
           paths.get(0).positions = path.map((id) => scenePositions[id]);
           paths.get(0).material.uniforms.color = Color.fromCssColorString(
-            p.frame?.pathValid ? "#80efbb" : "#ff7a82",
+            display?.pathValid ? "#80efbb" : "#ff7a82",
           ).withAlpha(0.9);
         }
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
-          dot.show = path.length > 1 && !!p.frame?.pathValid;
+          dot.show = path.length > 1 && !!display?.pathValid;
           if (path.length > 1) {
             const progress =
                 (((seconds / 16 + i / packets.length) % 1) + 1) % 1,

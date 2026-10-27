@@ -11,22 +11,50 @@ let engine: SimulationEngine | null = null,
   target: number | null = null,
   anchorWall = 0,
   anchorUs = 0,
-  lastSent = -Infinity;
+  lastSent = -Infinity,
+  lastCheckpoint = -Infinity,
+  lastMetrics = -1,
+  lastFailureCount = -1,
+  lastCompleted = false;
 function anchor() {
   anchorWall = performance.now();
   anchorUs = engine?.nowUs ?? 0;
 }
-function send() {
-  if (engine) {
-    port.postMessage({
-      type: "state",
-      runId,
-      frame: engine.snapshot(),
-      busy: target !== null,
-      playing,
-    });
-    lastSent = performance.now();
-  }
+function send(reset = false, verify = false) {
+  if (!engine) return;
+  const now = performance.now();
+  const { serviceOutages, linkFailures, ...progress } = engine.progress();
+  const completed = engine.nowUs === engine.scenario.durationUs;
+  const checkpoint =
+    reset || verify || now - lastCheckpoint >= 5000
+      ? engine.checkpoint()
+      : undefined;
+  const historiesChanged =
+    !!checkpoint ||
+    lastMetrics !== engine.metrics.events.length ||
+    completed !== lastCompleted;
+  const scenarioChanged =
+    !!checkpoint || lastFailureCount !== engine.scenario.failures.length;
+  const deltas = engine.drainDeltas();
+  port.postMessage({
+    type: "state",
+    runId,
+    progress,
+    busy: target !== null,
+    playing,
+    reset,
+    deltas: reset ? [] : deltas,
+    ...(checkpoint ? { checkpoint } : {}),
+    ...(historiesChanged
+      ? { histories: { serviceOutages, linkFailures } }
+      : {}),
+    ...(scenarioChanged ? { scenario: structuredClone(engine.scenario) } : {}),
+  });
+  if (checkpoint) lastCheckpoint = now;
+  lastMetrics = engine.metrics.events.length;
+  lastFailureCount = engine.scenario.failures.length;
+  lastCompleted = completed;
+  lastSent = now;
 }
 function fail(error: unknown, stop = true) {
   if (stop) {
@@ -49,7 +77,7 @@ port.onmessage = ({ data: c }) => {
       speed = c.speed;
       target = null;
       anchor();
-      send();
+      send(true);
       return;
     }
     if (!engine || c.runId !== runId) return;
@@ -60,7 +88,7 @@ port.onmessage = ({ data: c }) => {
         playing = c.playing;
         speed = c.speed;
         anchor();
-        send();
+        send(false, !playing);
         break;
       case "seek":
         if (
@@ -73,14 +101,17 @@ port.onmessage = ({ data: c }) => {
         runId = c.nextRunId;
         target = c.atUs;
         anchor();
-        send();
+        send(true);
+        break;
+      case "resync":
+        send(true);
         break;
       case "step":
         playing = false;
         target = null;
         engine.step();
         anchor();
-        send();
+        send(true);
         break;
       case "failure": {
         const event = {
@@ -138,12 +169,12 @@ function pump() {
         if (done && target !== null) {
           target = null;
           anchor();
-          send();
+          send(true);
         }
         if (engine.nowUs === engine.scenario.durationUs) {
           playing = false;
           anchor();
-          send();
+          send(false, true);
         }
         if (now - lastSent >= 100) send();
       }

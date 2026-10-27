@@ -725,3 +725,22 @@ button[aria-expanded="true"] {
     min-height: 34px;
   }
 }
+
+.service-summary {
+  font-size: 11px;
+  line-height: 1.7;
+  margin: 12px 0;
+}
+.service-summary > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.service-summary dt {
+  color: #9bb0c2;
+}
+.service-summary dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}

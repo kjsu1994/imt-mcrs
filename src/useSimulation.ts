@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import type { Scenario, FailureEvent, SimulationFrame } from "./engine";
 import type { Command, Reply } from "./protocol";
+import { TopologyStream } from "./topologyStream";
 export function useSimulation(
   scenario: Scenario,
   playing: boolean,
   speed: number,
 ) {
   const worker = useRef<Worker | null>(null),
-    id = useRef(0);
+    id = useRef(0),
+    topology = useRef(new TopologyStream());
   const [state, setState] = useState<{
       owner: Scenario;
       frame: SimulationFrame;
@@ -21,19 +23,62 @@ export function useSimulation(
     });
     worker.current = w;
     const runId = ++id.current;
-    let active = true;
+    let active = true,
+      syncing = false;
+    const stream = new TopologyStream();
+    topology.current = stream;
+    let currentScenario = scenario;
+    let histories: Pick<SimulationFrame, "serviceOutages" | "linkFailures"> = {
+      serviceOutages: [],
+      linkFailures: [],
+    };
     setError("");
     w.onmessage = ({ data }: MessageEvent<Reply>) => {
       if (!active || data.runId !== id.current) return;
       if (data.type === "error") setError(data.message);
-      else if (data.type === "state")
-        setState({
-          owner: scenario,
-          frame: data.frame,
-          busy: data.busy,
-          playing: data.playing,
-        });
-      else {
+      else if (data.type === "state") {
+        if (syncing && !data.reset) return;
+        try {
+          if (data.reset) {
+            if (!data.checkpoint) throw new Error("재동기화 상태가 없습니다.");
+            stream.reset(data.checkpoint);
+            syncing = false;
+          } else {
+            stream.receive(data.deltas);
+            if (stream.pendingCount > 8192)
+              throw new Error("표시 버퍼 재동기화가 필요합니다.");
+            if (data.checkpoint && !stream.matches(data.checkpoint))
+              throw new Error("전체 상태와 변경분이 일치하지 않습니다.");
+          }
+          if (data.scenario) currentScenario = data.scenario;
+          if (data.histories) histories = data.histories;
+          setState({
+            owner: scenario,
+            frame: {
+              ...data.progress,
+              ...histories,
+              scenario: currentScenario,
+            },
+            busy: data.busy,
+            playing: data.playing,
+          });
+        } catch (error) {
+          if (data.reset) {
+            setError(
+              error instanceof Error
+                ? error.message
+                : "토폴로지 재동기화에 실패했습니다.",
+            );
+            return;
+          }
+          syncing = true;
+          setState((s) => (s ? { ...s, busy: true } : s));
+          w.postMessage({
+            type: "resync",
+            runId: id.current,
+          } satisfies Command);
+        }
+      } else {
         const url = URL.createObjectURL(
             new Blob([JSON.stringify(data.data, null, 2)], {
               type: "application/json",
@@ -74,9 +119,11 @@ export function useSimulation(
     worker.current?.postMessage(command);
   }
   return {
+    topology: topology.current,
     frame: state?.owner === scenario ? state.frame : null,
     runId: id.current,
-    running: state?.owner === scenario && state.playing && !state.busy && playing,
+    running:
+      state?.owner === scenario && state.playing && !state.busy && playing,
     busy: state?.owner !== scenario || state.busy,
     ended:
       state?.owner === scenario && state.frame.timeUs === scenario.durationUs,
