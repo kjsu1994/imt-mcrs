@@ -1,13 +1,26 @@
 import { mesh, positions, activeEdges, pathLength, validate } from "./model";
 import type { Config } from "./model";
 import { MetricsEngine } from "./metrics";
-import { computeRoute } from "./routing";
+import {
+  bfsStrategy,
+  DEFAULT_LINK_LOAD,
+  linkMetrics,
+  evaluatePath,
+} from "./routing";
+import type {
+  LinkLoad,
+  NetworkLink,
+  RoutingGraph,
+  RoutingStrategy,
+  PathCandidate,
+} from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "bfs-service-v2";
+export const MODEL_VERSION = "link-attributes-v3";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
+export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   config: Config;
   epochMs: number;
   durationUs: number;
@@ -18,6 +31,7 @@ export type Scenario = {
   computeDelayUs: number;
   installDelayUs: number;
   failures: FailureEvent[];
+  linkMetricUpdates: LinkMetricUpdate[];
 };
 export type LinkState = {
   id: string;
@@ -36,7 +50,7 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     config: { ...config },
     epochMs,
     durationUs: 86400 * SECOND,
@@ -47,15 +61,18 @@ export function createScenario(
     computeDelayUs: 1000,
     installDelayUs: 1000,
     failures: [],
+    linkMetricUpdates: [],
   };
 }
 export function normalizeScenario(input: unknown): Scenario {
   if (!input || typeof input !== "object")
     throw new Error("시나리오 형식이 올바르지 않습니다.");
   const version = (input as { schemaVersion?: number }).schemaVersion;
-  if (version !== undefined && version !== 1 && version !== 2)
+  if (version !== undefined && version !== 1 && version !== 2 && version !== 3)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 2 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 3 } as Scenario;
+  if (version !== 3 && scenario.linkMetricUpdates === undefined)
+    scenario.linkMetricUpdates = [];
   validateScenario(scenario);
   return scenario;
 }
@@ -85,7 +102,7 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 2)
+  if (s.schemaVersion !== 3)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
@@ -111,6 +128,23 @@ export function validateScenario(s: Scenario) {
     if (seen.has(key))
       throw new Error("같은 시각·링크의 장애 일정이 중복됩니다.");
     seen.add(key);
+  }
+  if (!Array.isArray(s.linkMetricUpdates))
+    throw new Error("링크 속성 변경은 배열이어야 합니다.");
+  const metricSeen = new Set<string>();
+  for (const e of s.linkMetricUpdates) {
+    if (!e || typeof e !== "object")
+      throw new Error("잘못된 링크 속성 변경입니다.");
+    integer(e.atUs, 0, s.durationUs, "속성 변경 시각");
+    if (!ids.has(e.linkId)) throw new Error("알 수 없는 속성 변경 링크입니다.");
+    integer(e.bufferCapacityPackets, 1, Number.MAX_SAFE_INTEGER, "버퍼 용량");
+    integer(e.queuedPackets, 0, e.bufferCapacityPackets, "버퍼 점유량");
+    if (!Number.isFinite(e.jitterMs) || e.jitterMs < 0)
+      throw new Error("가상 지터는 유한한 비음수여야 합니다.");
+    const key = `${e.atUs}:${e.linkId}`;
+    if (metricSeen.has(key))
+      throw new Error("같은 시각·링크의 속성 변경이 중복됩니다.");
+    metricSeen.add(key);
   }
 }
 type Event = {
@@ -175,6 +209,15 @@ export class SimulationEngine {
   private missed = new Map<string, number>();
   private tokens = new Map<string, number>();
   private installed: number[] = [];
+  private linkLoads = new Map<string, LinkLoad>();
+  private installedEvaluation: {
+    evaluatedUs: number;
+    candidate: PathCandidate | null;
+  } | null = null;
+  private routingEvaluations: {
+    evaluatedUs: number;
+    candidates: PathCandidate[];
+  }[] = [];
   private requestedVersion = -1;
   private physicalCommitUs = -1;
   private dirtyLinks = new Set<string>();
@@ -184,7 +227,10 @@ export class SimulationEngine {
   private committedValid = false;
   private stateRevision = 0;
   private deltas: TopologyDelta[] = [];
-  constructor(input: unknown) {
+  constructor(
+    input: unknown,
+    private readonly strategy: RoutingStrategy = bfsStrategy,
+  ) {
     const scenario = normalizeScenario(input);
     this.scenario = scenario;
     this.metrics = new MetricsEngine(scenario.source, scenario.target);
@@ -192,7 +238,23 @@ export class SimulationEngine {
     this.geometric = this.geometry(0);
     this.physical = new Set(this.geometric);
     this.known = new Set(this.geometric);
-    this.installed = this.calculate();
+    for (const e of scenario.linkMetricUpdates) {
+      const apply = () => {
+        this.linkLoads.set(e.linkId, {
+          bufferCapacityPackets: e.bufferCapacityPackets,
+          queuedPackets: e.queuedPackets,
+          jitterMs: e.jitterMs,
+        });
+      };
+      if (e.atUs === 0) apply();
+      else this.schedule(e.atUs, 1, apply);
+    }
+    const initial = this.calculate();
+    this.installed = initial.candidates[0]?.nodes ?? [];
+    this.installedEvaluation = {
+      evaluatedUs: initial.evaluatedUs,
+      candidate: initial.candidates[0] ?? null,
+    };
     this.metrics.record({
       atUs: 0,
       type: "route-installed",
@@ -415,22 +477,70 @@ export class SimulationEngine {
       }
     });
   }
+  private networkLink(
+    a: number,
+    b: number,
+    p: ReturnType<typeof positions>,
+  ): NetworkLink {
+    const id = edgeId(a, b);
+    return {
+      id,
+      sourceId: a,
+      targetId: b,
+      knownAvailable: this.known.has(id),
+      metrics: linkMetrics(
+        p[a],
+        p[b],
+        this.linkLoads.get(id) ?? DEFAULT_LINK_LOAD,
+      ),
+    };
+  }
+  graph(): RoutingGraph {
+    const p = positions(
+      this.scenario.config,
+      this.nowUs / SECOND,
+      this.scenario.epochMs,
+    );
+    return {
+      nodeCount: p.length,
+      links: this.edges.map(([a, b]) => this.networkLink(a, b, p)),
+    };
+  }
+  private currentPathMetrics(p: ReturnType<typeof positions>) {
+    const links = this.installed
+      .slice(1)
+      .map((b, i) => this.networkLink(this.installed[i], b, p));
+    return {
+      evaluatedUs: this.nowUs,
+      candidate: this.validPath() ? evaluatePath(this.installed, links) : null,
+    };
+  }
   private calculate() {
-    const result = computeRoute(
-      this.scenario.config.planes * this.scenario.config.perPlane,
-      this.edges.filter(([a, b]) => this.known.has(edgeId(a, b))),
+    const graph = this.graph();
+    const started = performance.now();
+    const candidates = this.strategy.calculate(
+      graph,
       this.scenario.source,
       this.scenario.target,
     );
-    this.profiling.push({ atUs: this.nowUs, wallMs: result.wallMs });
-    return result.path;
+    this.profiling.push({
+      atUs: this.nowUs,
+      wallMs: performance.now() - started,
+    });
+    const evaluation = {
+      evaluatedUs: this.nowUs,
+      candidates: structuredClone(candidates),
+    };
+    this.routingEvaluations.push(evaluation);
+    return evaluation;
   }
   private requestRoute() {
     if (this.requestedVersion === this.version) return;
     const version = this.version;
     this.requestedVersion = version;
     this.metrics.record({ atUs: this.nowUs, type: "route-started", version });
-    const candidate = this.calculate();
+    const evaluation = this.calculate();
+    const candidate = evaluation.candidates[0]?.nodes ?? [];
     this.schedule(this.nowUs + this.scenario.computeDelayUs, 3, () => {
       if (version !== this.version) {
         this.metrics.record({
@@ -455,7 +565,11 @@ export class SimulationEngine {
           });
           return;
         }
-        this.installed = candidate;
+        this.installed = [...candidate];
+        this.installedEvaluation = {
+          evaluatedUs: evaluation.evaluatedUs,
+          candidate: structuredClone(evaluation.candidates[0] ?? null),
+        };
         this.metrics.record({
           atUs: this.nowUs,
           type: "route-installed",
@@ -505,6 +619,9 @@ export class SimulationEngine {
       path: [...this.installed],
       pathValid: this.validPath(),
       length: pathLength(this.installed, p),
+      routingAlgorithm: this.strategy.name,
+      currentPathMetrics: this.currentPathMetrics(p),
+      installedEvaluation: structuredClone(this.installedEvaluation),
       physicalLinkCount: this.physical.size,
       ...this.metrics.summary(
         this.nowUs,
@@ -523,6 +640,16 @@ export class SimulationEngine {
   result() {
     return {
       modelVersion: MODEL_VERSION,
+      routingAlgorithm: this.strategy.name,
+      routingEvaluations: structuredClone(this.routingEvaluations),
+      installedEvaluation: structuredClone(this.installedEvaluation),
+      currentPathMetrics: this.currentPathMetrics(
+        positions(
+          this.scenario.config,
+          this.nowUs / SECOND,
+          this.scenario.epochMs,
+        ),
+      ),
       timeUs: this.nowUs,
       completed: this.nowUs === this.scenario.durationUs,
       path: [...this.installed],

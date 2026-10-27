@@ -744,3 +744,22 @@ button[aria-expanded="true"] {
   text-align: right;
   overflow-wrap: anywhere;
 }
+
+.link-metrics {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0;
+  font-size: 11px;
+}
+.link-metrics > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.link-metrics dt {
+  color: #8fa3b5;
+}
+.link-metrics dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}

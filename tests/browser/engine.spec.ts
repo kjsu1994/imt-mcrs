@@ -1,6 +1,10 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
-import { SimulationEngine } from "../../src/engine.ts";
+import {
+  SimulationEngine,
+  createScenario,
+  DEFAULT_EPOCH_MS,
+} from "../../src/engine.ts";
 test("Worker results match headless replay with normal and throttled rendering", async ({
   browser,
 }) => {
@@ -73,7 +77,18 @@ test("Worker results match headless replay with normal and throttled rendering",
     const exported = JSON.parse(
       await readFile((await download.path())!, "utf8"),
     );
-    expect(exported.scenario.schemaVersion).toBe(2);
+    expect(exported.scenario.schemaVersion).toBe(3);
+    await expect(
+      page.getByLabel("현재 경로 속성", { exact: true }),
+    ).toContainText("100.0 %");
+    await expect(
+      page.getByLabel("현재 경로 속성", { exact: true }),
+    ).toContainText("0.00 ms");
+    expect(exported.result.routingAlgorithm).toBe("BFS");
+    expect(
+      exported.result.currentPathMetrics.candidate.propagationDelayMs,
+    ).toBeGreaterThan(0);
+    expect(exported.result.routingEvaluations.length).toBeGreaterThan(0);
     expect(exported.scenario.epochMs).toBe(Date.UTC(2026, 0, 1));
     expect(exported.result.outageCount).toBe(1);
     expect(exported.result.linkFailures).toHaveLength(2);
@@ -127,4 +142,101 @@ test("UTC is fixed and editable while unused seed is explicitly reserved", async
   await page.getByRole("button", { name: "실험 적용", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("시작 시각");
   await expect(page.locator("time")).toContainText("2026-02-02 03:04:05");
+});
+
+test("manual link metrics survive Worker seeks and result export", async ({
+  page,
+}) => {
+  const scenario = {
+    ...createScenario(
+      { planes: 1, perPlane: 8, altitude: 2000, inclination: 0, phase: 0 },
+      DEFAULT_EPOCH_MS,
+      0,
+      3,
+    ),
+    durationUs: 3000000,
+    linkMetricUpdates: [
+      {
+        atUs: 0,
+        linkId: "0:1",
+        bufferCapacityPackets: 1000,
+        queuedPackets: 800,
+        jitterMs: 2,
+      },
+      {
+        atUs: 500000,
+        linkId: "0:1",
+        bufferCapacityPackets: 1000,
+        queuedPackets: 950,
+        jitterMs: 5,
+      },
+    ],
+    failures: [{ atUs: 1000000, linkId: "0:1", down: true }],
+  };
+  await page.goto("/");
+  const result = await page.evaluate(async (scenario) => {
+    const worker = new Worker("/src/simulation.worker.ts", { type: "module" });
+    function request(
+      message: object,
+      accepts: (reply: any) => boolean,
+    ): Promise<any> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          worker.terminate();
+          reject(new Error("Worker timeout"));
+        }, 15000);
+        worker.onmessage = ({ data }) => {
+          if (data.type === "error") {
+            clearTimeout(timer);
+            reject(new Error(data.message));
+          } else if (accepts(data)) {
+            clearTimeout(timer);
+            resolve(data);
+          }
+        };
+        worker.postMessage(message);
+      });
+    }
+    try {
+      const initial = await request(
+        { type: "load", runId: 1, scenario, playing: false, speed: 1 },
+        (r) => r.type === "state" && r.reset,
+      );
+      const changed = await request(
+        { type: "seek", runId: 1, nextRunId: 2, atUs: 500000 },
+        (r) => r.type === "state" && r.runId === 2 && !r.busy,
+      );
+      const reset = await request(
+        { type: "seek", runId: 2, nextRunId: 3, atUs: 0 },
+        (r) => r.type === "state" && r.runId === 3 && !r.busy,
+      );
+      await request(
+        { type: "finish", runId: 3 },
+        (r) =>
+          r.type === "state" &&
+          !r.busy &&
+          r.progress.timeUs === scenario.durationUs,
+      );
+      const exported = await request(
+        { type: "export", runId: 3, what: "result" },
+        (r) => r.type === "export",
+      );
+      return {
+        initial: initial.progress.currentPathMetrics,
+        changed: changed.progress.currentPathMetrics,
+        reset: reset.progress.currentPathMetrics,
+        exported: exported.data,
+      };
+    } finally {
+      worker.terminate();
+    }
+  }, scenario);
+  expect(result.initial.candidate.availableBufferRatio).toBe(0.2);
+  expect(result.changed.candidate.availableBufferRatio).toBe(0.05);
+  expect(result.changed.candidate.jitterMs).toBe(5);
+  expect(result.reset).toEqual(result.initial);
+  expect(result.exported.scenario).toEqual(scenario);
+  const core = new SimulationEngine(scenario);
+  core.advanceTo(scenario.durationUs);
+  expect(result.exported.result).toEqual(core.result());
 });

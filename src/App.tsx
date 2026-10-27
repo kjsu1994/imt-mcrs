@@ -500,6 +500,36 @@ export default function App() {
                   <small> km</small>
                 </strong>
               </div>
+              <dl
+                className="link-metrics"
+                aria-label="현재 경로 속성"
+                title="논리 시각 기준. 버퍼는 설정된 큐 상태, 지터는 가상 입력입니다."
+              >
+                <div>
+                  <dt>전파 지연</dt>
+                  <dd>
+                    {frame?.currentPathMetrics?.candidate
+                      ? `${frame?.currentPathMetrics.candidate.propagationDelayMs.toFixed(2)} ms`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>가용 버퍼</dt>
+                  <dd>
+                    {frame?.currentPathMetrics?.candidate
+                      ? `${(frame?.currentPathMetrics.candidate.availableBufferRatio * 100).toFixed(1)} %`
+                      : "—"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>가상 지터</dt>
+                  <dd>
+                    {frame?.currentPathMetrics?.candidate
+                      ? `${frame?.currentPathMetrics.candidate.jitterMs.toFixed(2)} ms`
+                      : "—"}
+                  </dd>
+                </div>
+              </dl>
               <p className="route-path">
                 {snapshot.path.length
                   ? snapshot.path
