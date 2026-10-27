@@ -596,3 +596,132 @@ button[aria-expanded="true"] {
     padding: 4px;
   }
 }
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.brand img {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+.brand h1 {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.org-logo {
+  width: 90px;
+  height: 32px;
+  object-fit: contain;
+}
+.topbar nav {
+  justify-self: end;
+}
+.button-row {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.button-row button {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  padding: 8px;
+}
+.model-caption {
+  font-size: 11px;
+  line-height: 1.6;
+  color: #9bb0c2;
+  margin: 12px 0 0;
+}
+.panel h3 {
+  font-size: 12px;
+  margin: 20px 0 10px;
+}
+.recovery-list,
+.event-list {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0;
+  font-size: 11px;
+  line-height: 1.7;
+}
+.recovery-list li {
+  padding: 10px 0;
+  border-top: 1px solid #253645;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px;
+}
+.recovery-list li > small {
+  grid-column: 1/-1;
+  color: #9bb0c2;
+}
+.recovery-list strong {
+  font-weight: 500;
+}
+.recovery-list strong small {
+  font-weight: 400;
+  color: #9bb0c2;
+  font-size: 10px;
+}
+.event-list li {
+  padding: 4px 0;
+}
+.failure-panel details {
+  font-size: 11px;
+  color: #9bb0c2;
+  margin-top: 12px;
+}
+.legend .legend-failed {
+  width: 12px;
+  height: 2px;
+  border-radius: 0;
+  background: #ff7a82;
+}
+@media (max-width: 1100px) {
+  .brand h1 {
+    display: none;
+  }
+}
+@media (max-width: 650px) {
+  .topbar {
+    grid-template-columns: 1fr auto 1fr;
+    gap: 7px;
+  }
+  .brand {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .brand img {
+    width: 36px;
+    height: 36px;
+  }
+  .org-logo {
+    grid-column: 2;
+    grid-row: 1;
+    width: 76px;
+    height: 28px;
+  }
+  .topbar nav {
+    grid-column: 1/-1;
+    justify-self: stretch;
+    justify-content: center;
+    flex-wrap: nowrap;
+  }
+  .topbar nav button {
+    flex: 1;
+  }
+  .button-row button {
+    min-height: 34px;
+  }
+}

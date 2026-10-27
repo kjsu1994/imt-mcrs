@@ -9,7 +9,6 @@ import {
   PointPrimitiveCollection,
   PolylineCollection,
   JulianDate,
-  ClockRange,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
   Math as CMath,
@@ -22,34 +21,27 @@ import {
 } from "cesium";
 import {
   EARTH_RADIUS,
-  activeEdges,
-  mesh,
   positions,
-  route,
-  pathLength,
   inertial,
   fixed,
   gmst,
-  DAY,
   period,
 } from "./model";
 import type { Config, Vec3 } from "./model";
-export type Snapshot = {
-  seconds: number;
+import type { SimulationFrame } from "./engine";
+import { DisplayClock } from "./displayClock";
+export type Telemetry = {
   latitude: number;
   longitude: number;
   altitude: number;
-  links: number;
-  path: number[];
-  length: number;
-  fps: number;
 };
 type Props = {
   config: Config;
   startMs: number;
-  playing: boolean;
-  speed: number;
-  seek: { seconds: number; revision: number };
+  frame: SimulationFrame | null;
+  runId: number;
+  running: boolean;
+  selectedLink: string;
   selected: number | null;
   source: number;
   target: number;
@@ -58,7 +50,8 @@ type Props = {
   tracking: boolean;
   home: number;
   onPick: (id: number) => void;
-  onSnapshot: (s: Snapshot) => void;
+  onTelemetry: (s: Telemetry) => void;
+  onPickLink: (id: string) => void;
   onError: (s: string) => void;
 };
 const palette = [
@@ -77,7 +70,8 @@ export default function Globe(props: Props) {
   useEffect(() => {
     let viewer: Viewer | undefined,
       handler: ScreenSpaceEventHandler | undefined,
-      disposed = false;
+      disposed = false,
+      releaseRotation = () => {};
     try {
       viewer = new Viewer(container.current!, {
         baseLayer: false,
@@ -103,6 +97,7 @@ export default function Globe(props: Props) {
       const controller = viewer.scene.screenSpaceCameraController;
       viewer.camera.constrainedAxis = undefined;
       controller.enableTranslate = false;
+      controller.enableRotate = false;
       controller.enableTilt = false;
       controller.enableLook = false;
       const earthFrame = Transforms.eastNorthUpToFixedFrame(Cartesian3.ZERO);
@@ -114,13 +109,8 @@ export default function Globe(props: Props) {
       };
       const start = JulianDate.fromDate(new Date(props.startMs));
       viewer.clock.startTime = start.clone();
-      viewer.clock.stopTime = JulianDate.addSeconds(
-        start,
-        DAY,
-        new JulianDate(),
-      );
       viewer.clock.currentTime = start.clone();
-      viewer.clock.clockRange = ClockRange.CLAMPED;
+      viewer.clock.shouldAnimate = false;
       void SingleTileImageryProvider.fromUrl(
         `${import.meta.env.BASE_URL}textures/earth.jpg`,
         {
@@ -145,9 +135,9 @@ export default function Globe(props: Props) {
       const packets = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
       ) as PointPrimitiveCollection;
-      const wires = viewer.scene.primitives.add(
-        new PolylineCollection(),
-      ) as PolylineCollection;
+      // Small collections avoid Cesium scanning thousands of earlier lines for every position update.
+      const wireGroups: PolylineCollection[] = [];
+      const linesPerGroup = 128;
       const paths = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
@@ -155,59 +145,76 @@ export default function Globe(props: Props) {
         new PolylineCollection(),
       ) as PolylineCollection;
       let config: Config | null = null,
-        edges: [number, number][] = [],
         wireIds: [number, number][] = [],
         lastSelected: number | null | undefined,
         lastAll: boolean | undefined,
         lastHome = -1,
-        lastSeek = -1,
         routeKey = "",
         linkKey = "",
         orbitBucket = -1,
         lastReport = 0,
-        lastLines = -Infinity,
         lastStyle = "",
-        lastEndpoints = "",
-        lastTopology = -Infinity,
-        active: [number, number][] = [],
-        path: number[] = [],
-        frames: number[] = [],
-        lastFrame = performance.now(),
-        lastTrack = false;
+        lastSelectedLink = "",
+        lastFrame: SimulationFrame | null = null,
+        lastTrack = false,
+        lastRunId = -1,
+        lastClockFrame: SimulationFrame | null = null,
+        lastRunning = false,
+        dragging = false;
+      const displayClock = new DisplayClock();
       handler = new ScreenSpaceEventHandler(viewer.scene.canvas);
       handler.setInputAction((event: { position: Cartesian2 }) => {
         const picked = viewer!.scene.pick(event.position);
         if (picked && typeof picked.id === "number")
           current.current.onPick(picked.id);
+        else if (
+          picked &&
+          typeof picked.id === "string" &&
+          picked.id.startsWith("isl:")
+        )
+          current.current.onPickLink(picked.id.slice(4));
       }, ScreenSpaceEventType.LEFT_CLICK);
+      handler.setInputAction(() => { dragging = true; }, ScreenSpaceEventType.LEFT_DOWN);
+      handler.setInputAction(() => { dragging = false; }, ScreenSpaceEventType.LEFT_UP);
+      const releaseDrag = () => { dragging = false; };
+      window.addEventListener("pointerup", releaseDrag);
+      window.addEventListener("blur", releaseDrag);
+      releaseRotation = () => {
+        window.removeEventListener("pointerup", releaseDrag);
+        window.removeEventListener("blur", releaseDrag);
+      };
+      handler.setInputAction((movement: { startPosition: Cartesian2; endPosition: Cartesian2 }) => {
+        if (!dragging || current.current.tracking) return;
+        const camera = viewer!.camera, canvas = viewer!.scene.canvas;
+        const altitude = Math.max(0, Cartesian3.magnitude(camera.positionWC) - EARTH_RADIUS);
+        const sensitivity = Math.min(1, Math.max(0.01, altitude / 21000000));
+        camera.rotateRight((movement.startPosition.x - movement.endPosition.x) / canvas.clientWidth * Math.PI * 2 * 1.77 * sensitivity);
+        camera.rotateUp((movement.startPosition.y - movement.endPosition.y) / canvas.clientHeight * Math.PI * 1.77 * sensitivity);
+      }, ScreenSpaceEventType.MOUSE_MOVE);
       const update = () => {
         if (!viewer || viewer.isDestroyed()) return;
         const p = current.current,
           now = performance.now();
-        frames.push(now - lastFrame);
-        lastFrame = now;
-        if (frames.length > 120) frames.shift();
-        viewer.clock.shouldAnimate = p.playing;
-        viewer.clock.multiplier = p.speed;
-        if (lastSeek !== p.seek.revision) {
-          viewer.clock.currentTime = JulianDate.addSeconds(
-            start,
-            p.seek.seconds,
-            new JulianDate(),
-          );
-          lastSeek = p.seek.revision;
-          lastTopology = -Infinity;
+        if (lastClockFrame !== p.frame || lastRunId !== p.runId || lastRunning !== p.running) {
+          displayClock.receive(p.frame?.timeUs ?? 0, now,
+            p.running && lastRunning && lastRunId === p.runId && lastClockFrame !== null);
+          lastClockFrame = p.frame;
+          lastRunId = p.runId;
+          lastRunning = p.running;
         }
-        const seconds = JulianDate.secondsDifference(
-          viewer.clock.currentTime,
+        const seconds = displayClock.at(now) / 1000000;
+        viewer.clock.shouldAnimate = false;
+        viewer.clock.currentTime = JulianDate.addSeconds(
           start,
+          seconds,
+          new JulianDate(),
         );
+        const path = p.frame?.path ?? [];
         if (config !== p.config) {
           config = p.config;
-          edges = mesh(config);
           points.removeAll();
           packets.removeAll();
-          wires.removeAll();
+          wireGroups.forEach((group) => group.removeAll());
           paths.removeAll();
           orbits.removeAll();
           for (let id = 0; id < config.planes * config.perPlane; id++)
@@ -230,9 +237,8 @@ export default function Globe(props: Props) {
               outlineColor: Color.fromCssColorString("#e8aa32"),
               show: false,
             });
-          lastTopology = -Infinity;
+          lastFrame = null;
           lastStyle = "";
-          lastEndpoints = "";
           routeKey = "";
           linkKey = "";
           wireIds = [];
@@ -240,10 +246,11 @@ export default function Globe(props: Props) {
           orbitBucket = -1;
         }
         const pos = positions(p.config, seconds, p.startMs);
+        const scenePositions = pos.map(cart);
         const styleKey = `${p.selected}:${p.source}:${p.target}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
-          dot.position = cart(pos[id]);
+          dot.position = scenePositions[id];
           if (styleKey !== lastStyle) {
             dot.pixelSize =
               id === p.selected
@@ -263,56 +270,69 @@ export default function Globe(props: Props) {
           }
         }
         lastStyle = styleKey;
-        const topologyChanged = Math.abs(seconds - lastTopology) >= 1;
-        if (topologyChanged) {
-          active = activeEdges(edges, pos);
-          lastTopology = seconds;
-        }
-        const endpointKey = `${p.source}:${p.target}`;
-        if (topologyChanged || endpointKey !== lastEndpoints) {
-          path = route(pos.length, active, p.source, p.target);
-          lastEndpoints = endpointKey;
-        }
-        if (topologyChanged) {
-          const nextLinkKey = active.map((e) => e.join(":")).join(",");
+        if (lastFrame !== p.frame || lastSelectedLink !== p.selectedLink) {
+          const visibleLinks =
+            p.frame?.links.filter(
+              (link) =>
+                link.physical || link.forced || (link.known && !link.physical),
+            ) ?? [];
+          const nextLinkKey = visibleLinks
+            .map(
+              (link) =>
+                `${link.id}:${link.physical}:${link.known}:${link.id === p.selectedLink}`,
+            )
+            .join(",");
           if (linkKey !== nextLinkKey) {
-            wires.removeAll();
-            wireIds = active;
-            for (const [a, b] of active) {
-              const line = wires.add({
-                positions: [cart(pos[a]), cart(pos[b])],
-                width: 1,
+            wireGroups.forEach((group) => group.removeAll());
+            wireIds = [];
+            for (const link of visibleLinks) {
+              const groupIndex = Math.floor(wireIds.length / linesPerGroup);
+              const group = wireGroups[groupIndex] ?? (wireGroups[groupIndex] = viewer.scene.primitives.add(new PolylineCollection()) as PolylineCollection);
+              const line = group.add({
+                id: `isl:${link.id}`,
+                positions: [scenePositions[link.a], scenePositions[link.b]],
+                width: link.id === p.selectedLink ? 2 : 1,
               });
-              line.material.uniforms.color =
-                Color.fromCssColorString("#3f97b5").withAlpha(0.22);
+              line.material.uniforms.color = Color.fromCssColorString(
+                !link.physical
+                  ? "#ff7a82"
+                  : link.id === p.selectedLink
+                    ? "#cce4fa"
+                    : "#3f97b5",
+              ).withAlpha(
+                !link.physical || link.id === p.selectedLink ? 0.9 : 0.22,
+              );
+              wireIds.push([link.a, link.b]);
             }
             linkKey = nextLinkKey;
           }
+          lastFrame = p.frame;
+          lastSelectedLink = p.selectedLink;
         }
-        wires.show = p.links;
-        // Background mesh updates at 10 Hz; selected route and packets remain frame-synchronous.
-        if (p.links && now - lastLines >= 100) {
+        wireGroups.forEach((group) => { group.show = p.links; });
+        // Every visible primitive uses the same interpolated display time.
+        if (p.links) {
           for (let i = 0; i < wireIds.length; i++) {
             const [a, b] = wireIds[i];
-            wires.get(i).positions = [cart(pos[a]), cart(pos[b])];
+            wireGroups[Math.floor(i / linesPerGroup)].get(i % linesPerGroup).positions = [scenePositions[a], scenePositions[b]];
           }
-          lastLines = now;
         }
         const key = path.join(":");
         if (key !== routeKey) {
           paths.removeAll();
           if (path.length > 1)
-            paths.add({ positions: path.map((id) => cart(pos[id])), width: 3 });
+            paths.add({ positions: path.map((id) => scenePositions[id]), width: 3 });
           routeKey = key;
         }
         if (paths.length) {
-          paths.get(0).positions = path.map((id) => cart(pos[id]));
-          paths.get(0).material.uniforms.color =
-            Color.fromCssColorString("#80efbb").withAlpha(0.9);
+          paths.get(0).positions = path.map((id) => scenePositions[id]);
+          paths.get(0).material.uniforms.color = Color.fromCssColorString(
+            p.frame?.pathValid ? "#80efbb" : "#ff7a82",
+          ).withAlpha(0.9);
         }
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
-          dot.show = path.length > 1;
+          dot.show = path.length > 1 && !!p.frame?.pathValid;
           if (path.length > 1) {
             const progress =
                 (((seconds / 16 + i / packets.length) % 1) + 1) % 1,
@@ -387,18 +407,10 @@ export default function Globe(props: Props) {
             p.selected === null
               ? null
               : Cartographic.fromCartesian(cart(pos[p.selected]));
-          current.current.onSnapshot({
-            seconds,
+          current.current.onTelemetry({
             latitude: location ? CMath.toDegrees(location.latitude) : 0,
             longitude: location ? CMath.toDegrees(location.longitude) : 0,
             altitude: location ? location.height / 1000 : 0,
-            links: active.length,
-            path,
-            length: pathLength(path, pos),
-            fps: frames.length
-              ? 1000 /
-                [...frames].sort((a, b) => a - b)[Math.floor(frames.length / 2)]
-              : 0,
           });
           lastReport = now;
         }
@@ -415,6 +427,7 @@ export default function Globe(props: Props) {
     }
     return () => {
       disposed = true;
+      releaseRotation();
       handler?.destroy();
       if (viewer && !viewer.isDestroyed()) viewer.destroy();
     };

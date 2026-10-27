@@ -7,7 +7,7 @@ test("Earth remains centered after off-center zoom, drags and satellite tracking
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
   await expect(page.locator("canvas")).toBeVisible();
-  await page.waitForLoadState("networkidle");
+  await expect(page.locator(".run-status")).not.toHaveText("계산 중");
   // Inspect the live Cesium instance through DevTools without adding a production debug API.
   const moduleUrl = await page.evaluate(() =>
     performance
@@ -47,7 +47,38 @@ test("Earth remains centered after off-center zoom, drags and satellite tracking
     expect(c.range).toBeLessThanOrEqual(c.maximum + 10);
   }
   await centered();
+  const motion = await cdp.send("Runtime.callFunctionOn", {
+    objectId: objects.objectId!,
+    functionDeclaration: `function(){const v=this.find(v=>!v.isDestroyed());return new Promise(resolve=>{const times=[];function sample(){times.push(v.clock.currentTime.secondsOfDay);if(times.length<40)requestAnimationFrame(sample);else resolve(times);}requestAnimationFrame(sample);});}`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  const times = motion.result.value as number[];
+  expect(new Set(times).size).toBeGreaterThan(times.length * 0.6);
+  await page.getByRole("button", { name: "일시정지", exact: true }).click();
   const rotationBox = (await page.locator("canvas").boundingBox())!;
+  async function dragAngle(range: number) {
+    await cdp.send("Runtime.callFunctionOn", {
+      objectId: objects.objectId!,
+      functionDeclaration: `function(range){const c=this.find(v=>!v.isDestroyed()).camera,p=c.position,r=range/Math.hypot(p.x,p.y,p.z);p.x*=r;p.y*=r;p.z*=r;}`,
+      arguments: [{ value: range }],
+    });
+    await page.waitForTimeout(100);
+    const before = await camera();
+    const x = rotationBox.x + rotationBox.width / 2, y = rotationBox.y + rotationBox.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + rotationBox.width * 0.08, y, { steps: 8 });
+    await page.mouse.up();
+    const after = await camera();
+    return Math.acos(Math.min(1, Math.max(-1, (before.position.x*after.position.x + before.position.y*after.position.y + before.position.z*after.position.z) / (before.range*after.range))));
+  }
+  const farAngle = await dragAngle(6378137 + 21000000);
+  const nearAngle = await dragAngle(6378137 + 500000);
+  expect(farAngle).toBeGreaterThan(0.1);
+  expect(nearAngle).toBeGreaterThan(0);
+  expect(nearAngle / farAngle).toBeLessThan(0.1);
+  await page.getByRole("button", { name: "전체 보기", exact: true }).click();
   for (const [dx, dy] of [
     [0, 0.22],
     [0, -0.22],

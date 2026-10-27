@@ -24,7 +24,7 @@ test("offline globe, flow, controls and regeneration", async ({ page }) => {
   await expect(page.locator(".route-summary")).toContainText("홉");
   await page.getByRole("button", { name: "위성 추적", exact: false }).click();
   await page.getByRole("button", { name: "추적 해제", exact: false }).click();
-  await page.getByLabel("시뮬레이션 시간", { exact: true }).fill("1200");
+  await page.getByLabel("시뮬레이션 시간", { exact: true }).fill("120");
   await page.waitForTimeout(500);
   await page.getByRole("button", { name: "시간 초기화", exact: true }).click();
   await page.getByLabel("궤도 고도", { exact: true }).fill("0");
