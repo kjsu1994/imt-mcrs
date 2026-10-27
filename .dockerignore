@@ -1,0 +1,13 @@
+node_modules
+dist
+public/cesium
+.git
+.agents
+.codex
+.aws
+test-results
+playwright-report
+tests
+*.pdf
+*.tsbuildinfo
+*.log

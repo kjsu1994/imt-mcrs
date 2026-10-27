@@ -1,0 +1,8 @@
+name: mcsr-sim
+services:
+  web:
+    image: mcsr-sim:local
+    build: .
+    ports:
+      - "127.0.0.1:5174:80"
+    restart: unless-stopped

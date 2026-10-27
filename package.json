@@ -1,0 +1,28 @@
+{
+  "name": "mcsr-sim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "assets": "node scripts/copy-cesium.mjs",
+    "dev": "npm run assets && vite --host 127.0.0.1",
+    "build": "npm run assets && tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "tsx --test tests/*.test.ts",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "cesium": "1.146.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "tsx": "4.23.15",
+    "@playwright/test": "1.64.1"
+  }
+}

@@ -1,0 +1,33 @@
+# Dependencies and generated build output
+node_modules/
+dist/
+public/cesium/
+*.tsbuildinfo
+.vite/
+.cache/
+
+# Test and coverage output
+playwright-report/
+test-results/
+coverage/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+.aws/
+*.local
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Local reference papers (keep application assets tracked)
+/*.pdf
