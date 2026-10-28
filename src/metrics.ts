@@ -2,6 +2,8 @@ export type RecordEntry = {
   atUs: number;
   type: string;
   linkId?: string;
+  domainId?: number;
+  recipientDomainId?: number;
   path?: number[];
   version?: number;
   outageId?: number;

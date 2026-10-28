@@ -1,11 +1,6 @@
-import {
-  mesh,
-  positions,
-  activeEdges,
-  pathLength,
-  validate,
-  distance,
-} from "./model";
+import { McsrController } from "./mcsr";
+import type { SrdSettings, McsrView } from "./mcsr";
+import { mesh, positions, activeEdges, pathLength, validate } from "./model";
 import type { Config } from "./model";
 import { MetricsEngine } from "./metrics";
 import {
@@ -32,12 +27,13 @@ import type {
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "dominant-reference-v5";
+export const MODEL_VERSION = "mcsr-domains-v6";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   config: Config;
+  srd: SrdSettings;
   epochMs: number;
   durationUs: number;
   seed: number;
@@ -69,8 +65,12 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     config: { ...config },
+    srd: {
+      planesPerDomain: Math.min(2, config.planes),
+      satellitesPerDomain: Math.min(2, config.perPlane),
+    },
     epochMs,
     durationUs: 86400 * SECOND,
     seed: 1,
@@ -96,18 +96,20 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 2 &&
     version !== 3 &&
     version !== 4 &&
-    version !== 5
+    version !== 5 &&
+    version !== 6
   )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 5 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 6 } as Scenario;
   if (
     version !== 3 &&
     version !== 4 &&
     version !== 5 &&
+    version !== 6 &&
     scenario.linkMetricUpdates === undefined
   )
     scenario.linkMetricUpdates = [];
-  if (version !== 4 && version !== 5) {
+  if (version !== 4 && version !== 5 && version !== 6) {
     scenario.routing ??= {
       algorithm: "bfs",
       service: "LS",
@@ -116,6 +118,11 @@ export function normalizeScenario(input: unknown): Scenario {
     scenario.notificationDelayUs ??= 0;
     scenario.switchDelayUs ??= 0;
   }
+  if (version !== 6)
+    scenario.srd = {
+      planesPerDomain: Math.min(2, scenario.config?.planes),
+      satellitesPerDomain: Math.min(2, scenario.config?.perPlane),
+    };
   validateScenario(scenario);
   return scenario;
 }
@@ -130,6 +137,7 @@ export type TopologyDelta = {
   changedLinks: LinkChange[];
   route?: { path: number[]; pathValid: boolean };
   analysis?: RoutingAnalysis;
+  mcsr?: McsrView;
 };
 export type RenderCheckpoint = {
   timeUs: number;
@@ -137,6 +145,7 @@ export type RenderCheckpoint = {
   version: number;
   links: LinkState[];
   analysis: RoutingAnalysis;
+  mcsr?: McsrView;
   path: number[];
   pathValid: boolean;
 };
@@ -147,8 +156,11 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 5)
+  if (s.schemaVersion !== 6)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
+  if (!s.srd) throw new Error("SRD 설정이 필요합니다.");
+  integer(s.srd.planesPerDomain, 1, s.config.planes, "SRD 궤도면 수");
+  integer(s.srd.satellitesPerDomain, 1, s.config.perPlane, "SRD 슬롯 수");
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
   integer(s.epochMs, 0, 8640000000000000, "시작 시각");
@@ -167,7 +179,7 @@ export function validateScenario(s: Scenario) {
   integer(s.switchDelayUs, 0, s.durationUs, "예비 전환 지연");
   if (
     !s.routing ||
-    !["bfs", "candidate-paths", "dominant-paths"].includes(
+    !["bfs", "candidate-paths", "dominant-paths", "mcsr"].includes(
       s.routing.algorithm,
     ) ||
     !["LS", "TS", "HR"].includes(s.routing.service) ||
@@ -175,7 +187,7 @@ export function validateScenario(s: Scenario) {
   )
     throw new Error("잘못된 라우팅 설정입니다.");
   if (
-    s.routing.algorithm === "dominant-paths" &&
+    ["dominant-paths", "mcsr"].includes(s.routing.algorithm) &&
     s.config.planes * s.config.perPlane > DOMINANT_NODE_LIMIT
   )
     throw new Error("자동 우세 경로는 16기 이하 성좌를 적용한 뒤 선택하세요.");
@@ -302,6 +314,8 @@ export class SimulationEngine {
     search?: DominantSearchSummary;
   } | null = null;
   private strategy: RoutingStrategy;
+  private mcsr?: McsrController;
+  private committedMcsrKey = "";
   private inputRevision = 0;
   private requestAtUs = -1;
   private requestedVersion = -1;
@@ -324,7 +338,14 @@ export class SimulationEngine {
   constructor(input: unknown, strategy?: RoutingStrategy) {
     const scenario = normalizeScenario(input);
     this.scenario = scenario;
-    this.strategy = strategy ?? createRoutingStrategy(scenario.routing);
+    this.strategy =
+      strategy ??
+      createRoutingStrategy(scenario.routing, {
+        name: "MCSR",
+        reactsToMetrics: true,
+        calculate: (_graph, source, target, report) =>
+          this.mcsr!.calculate(source, target, report),
+      });
     this.metrics = new MetricsEngine(scenario.source, scenario.target);
     this.edges = mesh(scenario.config);
     this.geometric = this.geometry(0);
@@ -347,12 +368,20 @@ export class SimulationEngine {
             this.strategy.reactsToMetrics !== false ||
             scenario.routing.service === "HR"
           )
-            this.inputsChanged("metrics");
+            if (this.mcsr) this.updateMcsr("metrics");
+            else this.inputsChanged("metrics");
         }
       };
       if (e.atUs === 0) apply();
       else this.schedule(e.atUs, 1, apply);
     }
+    if (scenario.routing.algorithm === "mcsr")
+      this.mcsr = new McsrController(
+        scenario.config,
+        scenario.srd,
+        this.observedGraph(),
+        scenario.source,
+      );
     const initial = this.calculate();
     this.cachedCandidates = initial.candidates;
     const chosen = this.decide(
@@ -402,7 +431,7 @@ export class SimulationEngine {
       this.scenario.epochMs,
     );
     const delays = this.edges.map(
-      ([a, b]) => (distance(p[a], p[b]) / 299792458) * 1000,
+      ([a, b]) => linkMetrics(p[a], p[b], DEFAULT_LINK_LOAD).propagationDelayMs,
     );
     this.delayChanged = delays.some(
       (d, i) =>
@@ -422,7 +451,8 @@ export class SimulationEngine {
           this.scenario.routing.service === "HR") &&
         this.delayChanged
       )
-        this.inputsChanged("geometry-metrics");
+        if (this.mcsr) this.updateMcsr("geometry-metrics");
+        else this.inputsChanged("geometry-metrics");
       this.scheduleTopology(this.nowUs + SECOND);
     });
   }
@@ -510,12 +540,16 @@ export class SimulationEngine {
     const analysisChanged =
       `${this.analysis.id}:${this.analysis.status}` !==
       this.committedAnalysisKey;
-    if (changedLinks.length || routeChanged || analysisChanged) {
+    const mcsr = this.mcsr?.view();
+    const mcsrKey = mcsr ? JSON.stringify(mcsr) : "";
+    const mcsrChanged = mcsrKey !== this.committedMcsrKey;
+    if (changedLinks.length || routeChanged || analysisChanged || mcsrChanged) {
       this.deltas.push({
         timeUs: this.nowUs,
         stateRevision: ++this.stateRevision,
         version: this.version,
         changedLinks,
+        ...(mcsrChanged && mcsr ? { mcsr } : {}),
         ...(analysisChanged
           ? { analysis: structuredClone(this.analysis) }
           : {}),
@@ -524,6 +558,7 @@ export class SimulationEngine {
           : {}),
       });
     }
+    this.committedMcsrKey = mcsrKey;
     this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
     this.committedPath = path;
     this.committedValid = pathValid;
@@ -540,6 +575,7 @@ export class SimulationEngine {
       version: this.version,
       links: structuredClone([...this.committedLinks.values()]),
       analysis: structuredClone(this.analysis),
+      ...(this.mcsr ? { mcsr: this.mcsr.view() } : {}),
       path: [...this.installed],
       pathValid: this.validPath(),
     };
@@ -614,32 +650,37 @@ export class SimulationEngine {
       type: "notification-started",
       linkId: id,
     });
-    this.schedule(this.nowUs + this.scenario.notificationDelayUs, 2.25, () => {
-      if (this.tokens.get(id) !== token) {
+    this.schedule(
+      this.nowUs + (this.mcsr ? 0 : this.scenario.notificationDelayUs),
+      2.25,
+      () => {
+        if (this.tokens.get(id) !== token) {
+          this.metrics.record({
+            atUs: this.nowUs,
+            type: "notification-discarded",
+            linkId: id,
+          });
+          return;
+        }
+        if (this.known.has(id) === up) return;
+        if (up) this.known.add(id);
+        else this.known.delete(id);
+        this.dirtyLinks.add(id);
+        this.version++;
         this.metrics.record({
           atUs: this.nowUs,
-          type: "notification-discarded",
+          type: up ? "link-detected-up" : "link-known-down",
           linkId: id,
         });
-        return;
-      }
-      if (this.known.has(id) === up) return;
-      if (up) this.known.add(id);
-      else this.known.delete(id);
-      this.dirtyLinks.add(id);
-      this.version++;
-      this.metrics.record({
-        atUs: this.nowUs,
-        type: up ? "link-detected-up" : "link-known-down",
-        linkId: id,
-      });
-      this.metrics.record({
-        atUs: this.nowUs,
-        type: "notification-completed",
-        linkId: id,
-      });
-      this.inputsChanged(up ? "link-up" : "link-down");
-    });
+        this.metrics.record({
+          atUs: this.nowUs,
+          type: "notification-completed",
+          linkId: id,
+        });
+        if (this.mcsr) this.updateMcsr(up ? "link-up" : "link-down");
+        else this.inputsChanged(up ? "link-up" : "link-down");
+      },
+    );
   }
   private networkLink(
     a: number,
@@ -659,16 +700,61 @@ export class SimulationEngine {
       ),
     };
   }
-  graph(): RoutingGraph {
+  private observedGraph(): RoutingGraph {
     const p = positions(
       this.scenario.config,
-      this.nowUs / SECOND,
+      // MCSR advertisements sample geometry on the same one-second grid as visibility.
+      this.mcsr ? Math.floor(this.nowUs / SECOND) : this.nowUs / SECOND,
       this.scenario.epochMs,
     );
     return {
       nodeCount: p.length,
       links: this.edges.map(([a, b]) => this.networkLink(a, b, p)),
     };
+  }
+  graph(): RoutingGraph {
+    return this.mcsr?.graph() ?? this.observedGraph();
+  }
+  private updateMcsr(reason: string) {
+    const controller = this.mcsr!;
+    const before = controller.inputKey();
+    const updates = controller.update(this.observedGraph(), this.nowUs);
+    if (before !== controller.inputKey()) this.inputsChanged(reason);
+    for (const ad of updates) {
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "srd-local-update",
+        domainId: ad.domainId,
+        version: ad.revision,
+        reason,
+      });
+      for (const domain of controller.partition.domains) {
+        if (domain.id === ad.domainId) continue;
+        this.metrics.record({
+          atUs: this.nowUs,
+          type: "csib-notification-started",
+          domainId: ad.domainId,
+          recipientDomainId: domain.id,
+          version: ad.revision,
+        });
+        this.schedule(
+          this.nowUs + this.scenario.notificationDelayUs,
+          2.25,
+          () => {
+            const previous = controller.inputKey();
+            const accepted = controller.receive(ad, domain.id, this.nowUs);
+            this.metrics.record({
+              atUs: this.nowUs,
+              type: accepted ? "csib-received" : "csib-discarded",
+              domainId: ad.domainId,
+              recipientDomainId: domain.id,
+              version: ad.revision,
+            });
+            if (previous !== controller.inputKey()) this.inputsChanged(reason);
+          },
+        );
+      }
+    }
   }
   private currentPathMetrics(p: ReturnType<typeof positions>) {
     const links = this.installed
@@ -738,6 +824,7 @@ export class SimulationEngine {
       inputRevision: this.inputRevision,
       candidates: structuredClone(candidates),
       ...(search ? { search } : {}),
+      ...(this.mcsr ? { mcsr: structuredClone(this.mcsr.lastAnalysis) } : {}),
     };
     this.routingEvaluations.push(evaluation);
     return evaluation;
@@ -773,6 +860,14 @@ export class SimulationEngine {
       selectedId: selected ? candidateId(selected.nodes) : null,
       candidates: decisions,
       ...(search ? { search: structuredClone(search) } : {}),
+      ...(this.mcsr
+        ? {
+            mcsr:
+              mode === "reserve"
+                ? this.mcsr.describe(candidates)
+                : structuredClone(this.mcsr.lastAnalysis),
+          }
+        : {}),
     };
     this.analyses.push(structuredClone(this.analysis));
     this.metrics.record({
@@ -937,7 +1032,29 @@ export class SimulationEngine {
       this.nowUs = this.queue.peek().atUs;
       do {
         const event = this.queue.pop();
-        event.run();
+        try {
+          event.run();
+        } catch (error) {
+          if (!this.failure) {
+            this.failure = {
+              atUs: this.nowUs,
+              code:
+                error instanceof DominantSearchError
+                  ? error.code
+                  : "simulation-failed",
+              message: error instanceof Error ? error.message : String(error),
+              ...(error instanceof DominantSearchError
+                ? { search: structuredClone(error.search) }
+                : {}),
+            };
+            this.metrics.record({
+              atUs: this.nowUs,
+              type: "simulation-failed",
+              reason: this.failure.code,
+            });
+          }
+          throw error;
+        }
         processed++;
       } while (this.queue.peek() && this.queue.peek().atUs === this.nowUs);
       this.commitInstant();
@@ -967,12 +1084,13 @@ export class SimulationEngine {
       pathValid: this.validPath(),
       length: pathLength(this.installed, p),
       routingAlgorithm: this.strategy.name,
+      mcsr: this.mcsr?.view(),
       routingAnalysis: structuredClone(this.analysis),
       currentPathMetrics: this.currentPathMetrics(p),
       routingStages: this.metrics.events
         .slice(-24)
         .filter((e) =>
-          /notification|route-|reserve-|link-detected/.test(e.type),
+          /notification|route-|reserve-|link-detected|srd-|csib-/.test(e.type),
         )
         .slice(-8),
       installedEvaluation: structuredClone(this.installedEvaluation),
@@ -997,6 +1115,7 @@ export class SimulationEngine {
       routingAlgorithm: this.strategy.name,
       routingEvaluations: structuredClone(this.routingEvaluations),
       routingAnalyses: structuredClone(this.analyses),
+      ...(this.mcsr ? { mcsr: this.mcsr.exportState() } : {}),
       delayModel: {
         kind: "configured-logical-delays",
         notificationDelayUs: this.scenario.notificationDelayUs,

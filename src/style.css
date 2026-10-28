@@ -789,3 +789,15 @@ input[type="file"] {
   max-width: 100%;
   font-size: 11px;
 }
+
+.mcsr-summary {
+  overflow-wrap: anywhere;
+}
+.event-jump {
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  padding: 4px;
+}

@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import {
   Viewer,
   BillboardCollection,
+  LabelCollection,
   DistanceDisplayCondition,
   NearFarScalar,
   SingleTileImageryProvider,
@@ -53,6 +54,7 @@ type Props = {
   target: number;
   links: boolean;
   allOrbits: boolean;
+  showSrds: boolean;
   tracking: boolean;
   home: number;
   onPick: (id: number) => void;
@@ -141,6 +143,9 @@ export default function Globe(props: Props) {
       const satelliteIcons = viewer.scene.primitives.add(
         new BillboardCollection(),
       ) as BillboardCollection;
+      const dsLabels = viewer.scene.primitives.add(
+        new LabelCollection(),
+      ) as LabelCollection;
       const iconDistance = 5000000;
       const packets = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
@@ -154,7 +159,8 @@ export default function Globe(props: Props) {
       const previewLines = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
-      let previewKey = "";
+      let previewKey = "",
+        lastLinkStyle = "";
       const orbits = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
@@ -269,6 +275,7 @@ export default function Globe(props: Props) {
           config = p.config;
           points.removeAll();
           satelliteIcons.removeAll();
+          dsLabels.removeAll();
           packets.removeAll();
           wireGroups.forEach((group) => group.removeAll());
           paths.removeAll();
@@ -276,6 +283,17 @@ export default function Globe(props: Props) {
           previewKey = "";
           orbits.removeAll();
           for (let id = 0; id < config.planes * config.perPlane; id++) {
+            dsLabels.add({
+              position: Cartesian3.ZERO,
+              text: "",
+              show: false,
+              font: "12px sans-serif",
+              fillColor: Color.WHITE,
+              showBackground: true,
+              backgroundColor:
+                Color.fromCssColorString("#101827").withAlpha(0.85),
+              pixelOffset: new Cartesian2(0, -30),
+            });
             satelliteIcons.add({
               id,
               position: Cartesian3.ZERO,
@@ -326,32 +344,54 @@ export default function Globe(props: Props) {
           Cartesian3.magnitude(viewer.camera.positionWC) <
           EARTH_RADIUS + p.config.altitude * 1000 + iconDistance;
         satelliteIcons.show = iconView;
-        const styleKey = `${p.selected}:${p.source}:${p.target}`;
+        const srd = p.showSrds ? display?.mcsr : undefined;
+        const styleKey = `${p.selected}:${p.source}:${p.target}:${srd?.membership.join(":") ?? ""}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
           dot.position = scenePositions[id];
           if (iconView) satelliteIcons.get(id).position = scenePositions[id];
+          dsLabels.get(id).position = scenePositions[id];
           if (styleKey !== lastStyle) {
-            satelliteIcons.get(id).scale = id === p.selected ? 1.25 : 1;
+            const domain = srd?.domains[srd.membership[id]];
+            const isDs = domain?.ds === id;
+            dsLabels.get(id).show = isDs;
+            dsLabels.get(id).text = isDs ? `DS · S${domain!.id}` : "";
+            satelliteIcons.get(id).color = srd
+              ? Color.fromCssColorString(
+                  palette[srd.membership[id] % palette.length],
+                )
+              : Color.WHITE;
+            satelliteIcons.get(id).scale =
+              id === p.selected ? 1.25 : isDs ? 1.15 : 1;
+            dot.outlineColor = isDs ? Color.WHITE : Color.BLACK;
+            dot.outlineWidth = isDs ? 3 : 1;
             dot.pixelSize =
               id === p.selected
                 ? 11
                 : id === p.source || id === p.target
                   ? 8
-                  : 5;
+                  : isDs
+                    ? 9
+                    : 5;
             dot.color = Color.fromCssColorString(
               id === p.source
                 ? "#80efbb"
                 : id === p.target
                   ? "#ffbb78"
                   : palette[
-                      Math.floor(id / p.config.perPlane) % palette.length
+                      (srd?.membership[id] ??
+                        Math.floor(id / p.config.perPlane)) % palette.length
                     ],
             );
           }
         }
         lastStyle = styleKey;
-        if (lastFrame !== display || lastSelectedLink !== p.selectedLink) {
+        if (
+          lastFrame !== display ||
+          lastSelectedLink !== p.selectedLink ||
+          styleKey !== lastLinkStyle
+        ) {
+          lastLinkStyle = styleKey;
           const visibleLinks =
             display?.links.filter(
               (link) =>
@@ -360,7 +400,7 @@ export default function Globe(props: Props) {
           const nextLinkKey = visibleLinks
             .map(
               (link) =>
-                `${link.id}:${link.physical}:${link.known}:${link.id === p.selectedLink}`,
+                `${link.id}:${link.physical}:${link.known}:${link.id === p.selectedLink}:${srd?.membership[link.a] !== srd?.membership[link.b]}`,
             )
             .join(",");
           if (linkKey !== nextLinkKey) {
@@ -376,16 +416,26 @@ export default function Globe(props: Props) {
               const line = group.add({
                 id: `isl:${link.id}`,
                 positions: [scenePositions[link.a], scenePositions[link.b]],
-                width: link.id === p.selectedLink ? 2 : 1,
+                width:
+                  link.id === p.selectedLink ||
+                  (srd && srd.membership[link.a] !== srd.membership[link.b])
+                    ? 2
+                    : 1,
               });
               line.material.uniforms.color = Color.fromCssColorString(
                 !link.physical
                   ? "#ff7a82"
                   : link.id === p.selectedLink
                     ? "#cce4fa"
-                    : "#3f97b5",
+                    : srd && srd.membership[link.a] !== srd.membership[link.b]
+                      ? "#d8b4ff"
+                      : "#3f97b5",
               ).withAlpha(
-                !link.physical || link.id === p.selectedLink ? 0.9 : 0.22,
+                !link.physical || link.id === p.selectedLink
+                  ? 0.9
+                  : srd && srd.membership[link.a] !== srd.membership[link.b]
+                    ? 0.65
+                    : 0.22,
               );
               wireIds.push([link.a, link.b]);
             }
@@ -423,23 +473,36 @@ export default function Globe(props: Props) {
           ).withAlpha(0.9);
         }
         const preview = p.previewPath;
-        const nextPreview = preview.join(":");
+        const nextPreview = preview.join(":") + styleKey;
         if (nextPreview !== previewKey) {
           previewLines.removeAll();
-          if (preview.length > 1) {
+          if (!srd && preview.length > 1) {
             const line = previewLines.add({
               positions: preview.map((id) => scenePositions[id]),
               width: 5,
             });
             line.material.uniforms.color =
-              Color.fromCssColorString("#7eaaff").withAlpha(0.75);
-          }
+              Color.fromCssColorString("#7eaaff").withAlpha(0.85);
+          } else
+            for (let i = 1; i < preview.length; i++) {
+              const a = preview[i - 1],
+                b = preview[i];
+              const line = previewLines.add({
+                positions: [scenePositions[a], scenePositions[b]],
+                width: 5,
+              });
+              line.material.uniforms.color = Color.fromCssColorString(
+                srd && srd.membership[a] === srd.membership[b]
+                  ? palette[srd.membership[a] % palette.length]
+                  : "#7eaaff",
+              ).withAlpha(0.85);
+            }
           previewKey = nextPreview;
         }
-        if (previewLines.length)
-          previewLines.get(0).positions = preview.map(
-            (id) => scenePositions[id],
-          );
+        for (let i = 0; i < previewLines.length; i++)
+          previewLines.get(i).positions = srd
+            ? [scenePositions[preview[i]], scenePositions[preview[i + 1]]]
+            : preview.map((id) => scenePositions[id]);
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
           dot.show = path.length > 1 && !!display?.pathValid;

@@ -304,7 +304,7 @@ test("configured routing, decisions and phases replay identically across batches
 });
 test("v4 routing configuration rejects unknown algorithms, invalid templates and delays", () => {
   for (const change of [
-    { routing: { algorithm: "mcsr", service: "LS", candidatePaths: [] } },
+    { routing: { algorithm: "unknown", service: "LS", candidatePaths: [] } },
     { routing: { algorithm: "bfs", service: "unknown", candidatePaths: [] } },
     {
       routing: {
@@ -329,7 +329,7 @@ test("v4 routing configuration rejects unknown algorithms, invalid templates and
       ...old,
       ...(version === undefined ? {} : { schemaVersion: version }),
     });
-    assert.equal(migrated.schemaVersion, 5);
+    assert.equal(migrated.schemaVersion, 6);
     assert.equal(migrated.routing.algorithm, "bfs");
     assert.equal(migrated.switchDelayUs, 0);
   }

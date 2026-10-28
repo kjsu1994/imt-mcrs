@@ -48,7 +48,10 @@ export function linkMetrics(
   load: Readonly<LinkLoad>,
 ): LinkMetrics {
   return {
-    propagationDelayMs: (distance(a, b) / LIGHT_SPEED_M_S) * 1000,
+    // Picosecond resolution removes platform math roundoff from routing decisions.
+    propagationDelayMs: Number(
+      ((distance(a, b) / LIGHT_SPEED_M_S) * 1000).toFixed(9),
+    ),
     availableBufferRatio:
       (load.bufferCapacityPackets - load.queuedPackets) /
       load.bufferCapacityPackets,
@@ -106,7 +109,7 @@ export const bfsStrategy: RoutingStrategy = {
 
 export type ServiceType = "LS" | "TS" | "HR";
 export type RoutingSettings = {
-  algorithm: "bfs" | "candidate-paths" | "dominant-paths";
+  algorithm: "bfs" | "candidate-paths" | "dominant-paths" | "mcsr";
   service: ServiceType;
   candidatePaths: number[][];
 };
@@ -130,6 +133,7 @@ export type RoutingAnalysis = {
   selectedId: string | null;
   candidates: CandidateDecision[];
   search?: DominantSearchSummary;
+  mcsr?: import("./mcsr").McsrAnalysis;
 };
 export const candidateId = (nodes: number[]) => nodes.join(":");
 export function pathProblem(
@@ -254,7 +258,12 @@ export function analyseCandidates(
 }
 export function createRoutingStrategy(
   settings: RoutingSettings,
+  mcsr?: RoutingStrategy,
 ): RoutingStrategy {
+  if (settings.algorithm === "mcsr") {
+    if (!mcsr) throw new Error("MCSR 영역 상태가 필요합니다.");
+    return mcsr;
+  }
   if (settings.algorithm === "bfs") return bfsStrategy;
   if (settings.algorithm === "dominant-paths")
     return {

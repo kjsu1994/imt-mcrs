@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import Globe from "./Globe";
+import mcsrExample from "../examples/mcsr-routing.json";
 import type { Telemetry } from "./Globe";
 import { PRESETS, validate, period, mesh } from "./model";
 import {
@@ -41,6 +42,7 @@ export default function App() {
     [links, setLinks] = useState(true),
     [allOrbits, setAllOrbits] = useState(false),
     [tracking, setTracking] = useState(false),
+    [showSrds, setShowSrds] = useState(true),
     [home, setHome] = useState(0),
     [telemetry, setTelemetry] = useState(initial),
     [experiment, setExperiment] = useState(defaultExperiment),
@@ -75,10 +77,9 @@ export default function App() {
   );
   useEffect(() => setPreviewId(""), [scenario]);
   function updateRouting(routing: RoutingSettings) {
-    setLoadedScenario({
-      ...structuredClone(frame?.scenario ?? scenario),
-      routing,
-    });
+    const next = { ...structuredClone(frame?.scenario ?? scenario), routing };
+    validateScenario(next);
+    setLoadedScenario(next);
   }
   async function importScenario(file: File) {
     try {
@@ -116,7 +117,13 @@ export default function App() {
   function endpoint(source: number, target: number) {
     setSource(source);
     setTarget(target);
-    setLoadedScenario(null);
+    const next = {
+      ...structuredClone(frame?.scenario ?? scenario),
+      source,
+      target,
+      routing: { ...scenario.routing, candidatePaths: [] },
+    };
+    setLoadedScenario(next);
     setPreviewId("");
   }
   const snapshot = {
@@ -467,8 +474,21 @@ export default function App() {
                 >
                   <option value="bfs">BFS · 최단 홉</option>
                   <option
+                    value="mcsr"
+                    disabled={
+                      config.planes * config.perPlane > DOMINANT_NODE_LIMIT
+                    }
+                  >
+                    MCSR · 영역별 라우팅
+                    {config.planes * config.perPlane > DOMINANT_NODE_LIMIT
+                      ? " (16기 이하 필요)"
+                      : ""}
+                  </option>
+                  <option
                     value="dominant-paths"
-                    disabled={config.planes * config.perPlane > DOMINANT_NODE_LIMIT}
+                    disabled={
+                      config.planes * config.perPlane > DOMINANT_NODE_LIMIT
+                    }
                   >
                     자동 우세 경로 · 검증용
                     {config.planes * config.perPlane > DOMINANT_NODE_LIMIT
@@ -480,6 +500,62 @@ export default function App() {
                   </option>
                 </select>
               </label>
+              <button
+                onClick={() =>
+                  void importScenario(
+                    new File(
+                      [JSON.stringify(mcsrExample)],
+                      "mcsr-routing.json",
+                      { type: "application/json" },
+                    ),
+                  )
+                }
+              >
+                MCSR 예제 불러오기 · 16기
+              </button>
+              {scenario.routing.algorithm === "mcsr" && (
+                <div className="srd-settings" aria-label="SRD 설정">
+                  <div className="field-grid">
+                    {(
+                      [
+                        ["planesPerDomain", "SRD 궤도면 수", config.planes],
+                        ["satellitesPerDomain", "SRD 슬롯 수", config.perPlane],
+                      ] as const
+                    ).map(([key, label, max]) => (
+                      <label className="field" key={key}>
+                        {label}
+                        <select
+                          aria-label={label}
+                          value={scenario.srd[key]}
+                          onChange={(e) =>
+                            setLoadedScenario({
+                              ...structuredClone(frame?.scenario ?? scenario),
+                              srd: {
+                                ...scenario.srd,
+                                [key]: Number(e.target.value),
+                              },
+                            })
+                          }
+                        >
+                          {Array.from({ length: max }, (_, i) => (
+                            <option key={i + 1} value={i + 1}>
+                              {i + 1}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ))}
+                  </div>
+                  <label className="toggle">
+                    <input
+                      type="checkbox"
+                      checked={showSrds}
+                      onChange={(e) => setShowSrds(e.target.checked)}
+                    />
+                    SRD·DS 표시
+                  </label>
+                </div>
+              )}
               <label className="field">
                 서비스 유형
                 <select
@@ -538,6 +614,7 @@ export default function App() {
               source={source}
               target={target}
               links={links}
+              showSrds={showSrds}
               allOrbits={allOrbits}
               tracking={tracking}
               home={home}
@@ -695,14 +772,16 @@ export default function App() {
               </p>
               <span
                 className="route-method"
-                title="MCSR 미적용. 패킷 이동 속도는 실제 전송 속도와 다릅니다."
-                aria-label="최단 홉 시각화. MCSR 미적용. 패킷 이동 속도는 실제 전송 속도와 다릅니다."
+                title="패킷 이동 속도는 관찰용입니다."
+                aria-label="라우팅 모드"
               >
                 {frame?.routingAlgorithm === "BFS"
                   ? "최단 홉 · 시각화"
-                  : scenario.routing.algorithm === "dominant-paths"
-                    ? "자동 우세 경로 · 검증용"
-                    : "수동 후보 · 시각화"}
+                  : scenario.routing.algorithm === "mcsr"
+                    ? "MCSR · 영역별 라우팅"
+                    : scenario.routing.algorithm === "dominant-paths"
+                      ? "자동 우세 경로 · 검증용"
+                      : "수동 후보 · 시각화"}
               </span>
             </section>
             <section
@@ -738,6 +817,71 @@ export default function App() {
                   ? ` · ${(frame.routingAnalysis.atUs / SECOND).toFixed(3)}초`
                   : ""}
               </p>
+              {frame?.mcsr && (
+                <div className="mcsr-summary" aria-label="MCSR 영역 상태">
+                  <p className="model-caption">
+                    SRD {frame.mcsr.domains.length}개 · 출발 영역 S
+                    {frame.mcsr.sourceDomain}
+                  </p>
+                  {frame.routingAnalysis.mcsr && (
+                    <>
+                      <p className="model-caption">
+                        {frame.routingAnalysis.mcsr.comparison?.matched
+                          ? "기준 탐색 일치"
+                          : frame.routingAnalysis.mcsr.synchronized
+                            ? "기준 비교 없음 · 저장 후보"
+                            : "정보 전달 중 · 기준 비교 대기"}
+                      </p>
+                      <p className="model-caption">
+                        계산 입력:{" "}
+                        {frame.routingAnalysis.mcsr.dependencies
+                          .map((d) => `S${d.domainId} v${d.revision}`)
+                          .join(" · ")}
+                      </p>
+                    </>
+                  )}
+                  <details>
+                    <summary>DS·CSIB 수신 상태</summary>
+                    <ul className="event-list">
+                      {frame.mcsr.domains.map((d) => (
+                        <li key={d.id}>
+                          S{d.id} · DS {d.ds} · 로컬 v{d.revision}
+                          <br />
+                          수신{" "}
+                          {d.receivedVersions
+                            .map((v, i) => `S${i}:v${v}`)
+                            .join(" ")}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                  <details>
+                    <summary>영역 갱신 이력</summary>
+                    <ol className="event-list">
+                      {frame.mcsr.events.map((e, i) => (
+                        <li key={i}>
+                          <button
+                            className="event-jump"
+                            onClick={() => {
+                              setPlaying(false);
+                              setSelected(frame.mcsr!.domains[e.recipient].ds);
+                              jump(e.atUs / SECOND);
+                            }}
+                          >
+                            {(e.atUs / SECOND).toFixed(6)}초 · S{e.origin} → S
+                            {e.recipient} v{e.revision} ·{" "}
+                            {e.type === "local-update"
+                              ? "영역 갱신"
+                              : e.type === "csib-received"
+                                ? "CSIB 수신"
+                                : "오래된 통지 폐기"}
+                          </button>
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                </div>
+              )}
               {frame?.routingAnalysis.search && (
                 <div
                   className="search-summary"
@@ -787,6 +931,18 @@ export default function App() {
                   onClick={() => setPreviewId(previewId === c.id ? "" : c.id)}
                 >
                   <strong>{c.nodes.join(" → ")}</strong>
+                  {frame.routingAnalysis.mcsr?.segments.find(
+                    (s) => s.candidateId === c.id,
+                  ) && (
+                    <small>
+                      {frame.routingAnalysis.mcsr.segments
+                        .find((s) => s.candidateId === c.id)!
+                        .runs.map(
+                          (r) => `S${r.domainId} [${r.nodes.join(" → ")}]`,
+                        )
+                        .join(" → ")}
+                    </small>
+                  )}
                   <span>
                     {
                       (
@@ -826,32 +982,49 @@ export default function App() {
                 <ol className="event-list">
                   {frame?.routingStages.map((e, i) => (
                     <li key={i}>
-                      {(e.atUs / SECOND).toFixed(6)}초 ·{" "}
-                      {(
-                        {
-                          "notification-started": "통지 시작",
-                          "notification-completed": "통지 완료",
-                          "notification-discarded": "통지 취소",
-                          "route-decision": "후보 선택",
-                          "route-started": "재계산 시작",
-                          "route-computed": "재계산 완료",
-                          "reserve-switch-started": "예비 전환 시작",
-                          "reserve-switch-ready": "예비 전환 준비",
-                          "route-install-started": "설치 시작",
-                          "route-installed": "설치 완료",
-                          "route-discarded": "작업 폐기",
-                          "route-retained": "기존 경로 유지",
-                          "link-detected-down": "장애 감지",
-                          "link-detected-up": "복구 인지",
-                        } as Record<string, string>
-                      )[e.type] ?? e.type}
+                      <button
+                        className="event-jump"
+                        onClick={() => {
+                          setPlaying(false);
+                          if (e.linkId) setSelectedLink(e.linkId);
+                          if (e.domainId !== undefined && frame.mcsr)
+                            setSelected(frame.mcsr.domains[e.domainId].ds);
+                          jump(e.atUs / SECOND);
+                        }}
+                      >
+                        {(e.atUs / SECOND).toFixed(6)}초 ·{" "}
+                        {(
+                          {
+                            "srd-local-update": "영역 상태 갱신",
+                            "csib-notification-started": "DS 통지 시작",
+                            "csib-received": "CSIB 수신",
+                            "csib-discarded": "오래된 CSIB 폐기",
+                            "notification-started": "통지 시작",
+                            "notification-completed": "통지 완료",
+                            "notification-discarded": "통지 취소",
+                            "route-decision": "후보 선택",
+                            "route-started": "재계산 시작",
+                            "route-computed": "재계산 완료",
+                            "reserve-switch-started": "예비 전환 시작",
+                            "reserve-switch-ready": "예비 전환 준비",
+                            "route-install-started": "설치 시작",
+                            "route-installed": "설치 완료",
+                            "route-discarded": "작업 폐기",
+                            "route-retained": "기존 경로 유지",
+                            "link-detected-down": "장애 감지",
+                            "link-detected-up": "복구 인지",
+                          } as Record<string, string>
+                        )[e.type] ?? e.type}
+                      </button>
                     </li>
                   ))}
                 </ol>
               </details>
               {preview && (
                 <p className="model-caption">
-                  파란 선: 검토 후보 · 설치 경로와 별도
+                  {scenario.routing.algorithm === "mcsr" && showSrds
+                    ? "영역별 색상: 검토 후보 · 설치 경로와 별도"
+                    : "파란 선: 검토 후보 · 설치 경로와 별도"}
                 </p>
               )}
             </section>
@@ -1022,6 +1195,19 @@ export default function App() {
             </section>
             <section className="panel-section">
               <h2>위성 정보</h2>
+              {selected !== null && frame?.mcsr && (
+                <p className="model-caption">
+                  S{frame.mcsr.membership[selected]} ·{" "}
+                  {frame.mcsr.domains[frame.mcsr.membership[selected]].ds ===
+                  selected
+                    ? "DS"
+                    : frame.mcsr.domains[
+                          frame.mcsr.membership[selected]
+                        ].boundaryNodes.includes(selected)
+                      ? "경계 노드"
+                      : "내부 노드"}
+                </p>
+              )}
               <label className="field">
                 선택 위성
                 <select

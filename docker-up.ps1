@@ -12,7 +12,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     $buildDir = Join-Path $tempRoot ('mcsr-sim-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $buildDir | Out-Null
     try {
-        foreach ($name in @('Dockerfile', 'docker-compose.yml', '.dockerignore', 'package.json', 'package-lock.json', 'index.html', 'tsconfig.json', 'vite.config.ts', 'src', 'scripts')) {
+        foreach ($name in @('Dockerfile', 'docker-compose.yml', '.dockerignore', 'package.json', 'package-lock.json', 'index.html', 'tsconfig.json', 'vite.config.ts', 'src', 'scripts', 'examples')) {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $buildDir -Recurse
         }
         New-Item -ItemType Directory -Path (Join-Path $buildDir 'public') | Out-Null

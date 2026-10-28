@@ -64,7 +64,7 @@ test("imported candidate routing survives selection, seeks, export and failed im
     buffer: Buffer.from(
       JSON.stringify({
         ...data.scenario,
-        routing: { algorithm: "mcsr", service: "TS", candidatePaths: [] },
+        routing: { algorithm: "unknown", service: "TS", candidatePaths: [] },
       }),
     ),
   });
