@@ -1,3 +1,5 @@
+import { ControlTransport, ControlTransportError } from "./controlTransport";
+import type { ControlSettings } from "./controlTransport";
 import { McsrController } from "./mcsr";
 import type { SrdSettings, McsrView } from "./mcsr";
 import { mesh, positions, activeEdges, pathLength, validate } from "./model";
@@ -27,13 +29,14 @@ import type {
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "mcsr-domains-v6";
+export const MODEL_VERSION = "mcsr-control-v7";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   config: Config;
   srd: SrdSettings;
+  controlTransport: ControlSettings;
   epochMs: number;
   durationUs: number;
   seed: number;
@@ -65,12 +68,13 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     config: { ...config },
     srd: {
       planesPerDomain: Math.min(2, config.planes),
       satellitesPerDomain: Math.min(2, config.perPlane),
     },
+    controlTransport: { mode: "isl", ackTimeoutUs: SECOND },
     epochMs,
     durationUs: 86400 * SECOND,
     seed: 1,
@@ -97,19 +101,21 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 3 &&
     version !== 4 &&
     version !== 5 &&
-    version !== 6
+    version !== 6 &&
+    version !== 7
   )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 6 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 7 } as Scenario;
   if (
     version !== 3 &&
     version !== 4 &&
     version !== 5 &&
     version !== 6 &&
+    version !== 7 &&
     scenario.linkMetricUpdates === undefined
   )
     scenario.linkMetricUpdates = [];
-  if (version !== 4 && version !== 5 && version !== 6) {
+  if (version !== 4 && version !== 5 && version !== 6 && version !== 7) {
     scenario.routing ??= {
       algorithm: "bfs",
       service: "LS",
@@ -118,11 +124,13 @@ export function normalizeScenario(input: unknown): Scenario {
     scenario.notificationDelayUs ??= 0;
     scenario.switchDelayUs ??= 0;
   }
-  if (version !== 6)
+  if (version !== 6 && version !== 7)
     scenario.srd = {
       planesPerDomain: Math.min(2, scenario.config?.planes),
       satellitesPerDomain: Math.min(2, scenario.config?.perPlane),
     };
+  if (version !== 7)
+    scenario.controlTransport = { mode: "fixed", ackTimeoutUs: SECOND };
   validateScenario(scenario);
   return scenario;
 }
@@ -156,8 +164,14 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 6)
+  if (s.schemaVersion !== 7)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
+  if (
+    !s.controlTransport ||
+    !["fixed", "isl"].includes(s.controlTransport.mode)
+  )
+    throw new Error("잘못된 제어 통신 모드입니다.");
+  integer(s.controlTransport.ackTimeoutUs, 1, 86400 * SECOND, "ACK 제한 시간");
   if (!s.srd) throw new Error("SRD 설정이 필요합니다.");
   integer(s.srd.planesPerDomain, 1, s.config.planes, "SRD 궤도면 수");
   integer(s.srd.satellitesPerDomain, 1, s.config.perPlane, "SRD 슬롯 수");
@@ -315,6 +329,9 @@ export class SimulationEngine {
   } | null = null;
   private strategy: RoutingStrategy;
   private mcsr?: McsrController;
+  private control?: ControlTransport;
+  private routeInstalledAtUs = -1;
+  private routeInstalledMode: "initial" | "reserve" | "recalculate" = "initial";
   private committedMcsrKey = "";
   private inputRevision = 0;
   private requestAtUs = -1;
@@ -382,6 +399,76 @@ export class SimulationEngine {
         this.observedGraph(),
         scenario.source,
       );
+    if (this.mcsr && scenario.controlTransport.mode === "isl") {
+      this.control = new ControlTransport(
+        this.mcsr.partition.domains.map((d) => d.ds),
+        scenario.notificationDelayUs,
+        scenario.controlTransport.ackTimeoutUs,
+        {
+          nowUs: () => this.nowUs,
+          schedule: (atUs, priority, run) => this.schedule(atUs, priority, run),
+          graph: (domainId) => this.mcsr!.graph(domainId),
+          physical: (a, b) => {
+            const id = edgeId(a, b),
+              p = positions(
+                scenario.config,
+                this.nowUs / SECOND,
+                scenario.epochMs,
+              );
+            return {
+              available: this.physical.has(id),
+              token: this.tokens.get(id) ?? 0,
+              delayUs: Math.max(
+                1,
+                Math.ceil(
+                  linkMetrics(p[a], p[b], DEFAULT_LINK_LOAD)
+                    .propagationDelayMs * 1000,
+                ),
+              ),
+            };
+          },
+          receive: (ad, recipient) => {
+            const beforeGraph = this.mcsr!.graph();
+            const previous = this.mcsr!.inputKey(),
+              accepted = this.mcsr!.receive(ad, recipient, this.nowUs);
+            this.metrics.record({
+              atUs: this.nowUs,
+              type: accepted ? "csib-received" : "csib-discarded",
+              domainId: ad.domainId,
+              recipientDomainId: recipient,
+              version: ad.revision,
+            });
+            if (previous !== this.mcsr!.inputKey()) {
+              const afterGraph = this.mcsr!.graph(),
+                byId = new Map(afterGraph.links.map((l) => [l.id, l]));
+              const down = beforeGraph.links.some(
+                (l) => l.knownAvailable && !byId.get(l.id)?.knownAvailable,
+              );
+              const beforeIds = new Set(
+                beforeGraph.links
+                  .filter((l) => l.knownAvailable)
+                  .map((l) => l.id),
+              );
+              const up = afterGraph.links.some(
+                (l) => l.knownAvailable && !beforeIds.has(l.id),
+              );
+              const changedMetrics = beforeGraph.links.some((l) => {
+                const next = byId.get(l.id);
+                return (
+                  l.knownAvailable &&
+                  next?.knownAvailable &&
+                  JSON.stringify(l.metrics) !== JSON.stringify(next.metrics)
+                );
+              });
+              this.inputsChanged(
+                down && !up && !changedMetrics ? "link-down" : "csib-update",
+              );
+            }
+            return accepted;
+          },
+        },
+      );
+    }
     const initial = this.calculate();
     this.cachedCandidates = initial.candidates;
     const chosen = this.decide(
@@ -504,6 +591,10 @@ export class SimulationEngine {
       this.validPath(),
       [...missing].sort(),
       this.detectedLinks,
+      !this.validPath() || this.metrics.previousPath.length
+        ? this.graph()
+        : undefined,
+      this.routeInstalledAtUs === this.nowUs ? this.routeInstalledMode : null,
     );
     this.detectedLinks.clear();
   }
@@ -540,7 +631,7 @@ export class SimulationEngine {
     const analysisChanged =
       `${this.analysis.id}:${this.analysis.status}` !==
       this.committedAnalysisKey;
-    const mcsr = this.mcsr?.view();
+    const mcsr = this.mcsrView();
     const mcsrKey = mcsr ? JSON.stringify(mcsr) : "";
     const mcsrChanged = mcsrKey !== this.committedMcsrKey;
     if (changedLinks.length || routeChanged || analysisChanged || mcsrChanged) {
@@ -575,7 +666,7 @@ export class SimulationEngine {
       version: this.version,
       links: structuredClone([...this.committedLinks.values()]),
       analysis: structuredClone(this.analysis),
-      ...(this.mcsr ? { mcsr: this.mcsr.view() } : {}),
+      ...(this.mcsr ? { mcsr: this.mcsrView() } : {}),
       path: [...this.installed],
       pathValid: this.validPath(),
     };
@@ -715,6 +806,14 @@ export class SimulationEngine {
   graph(): RoutingGraph {
     return this.mcsr?.graph() ?? this.observedGraph();
   }
+  private mcsrView(): McsrView | undefined {
+    return this.mcsr
+      ? {
+          ...this.mcsr.view(),
+          ...(this.control ? { control: this.control.view() } : {}),
+        }
+      : undefined;
+  }
   private updateMcsr(reason: string) {
     const controller = this.mcsr!;
     const before = controller.inputKey();
@@ -728,6 +827,10 @@ export class SimulationEngine {
         version: ad.revision,
         reason,
       });
+      if (this.control) {
+        this.control.publish(ad);
+        continue;
+      }
       for (const domain of controller.partition.domains) {
         if (domain.id === ad.domainId) continue;
         this.metrics.record({
@@ -1002,6 +1105,8 @@ export class SimulationEngine {
         }
         this.decisionStatus(decisionId, "installed");
         this.installed = [...path];
+        this.routeInstalledAtUs = this.nowUs;
+        this.routeInstalledMode = mode;
         this.installedEvaluation = {
           evaluatedUs: evaluation.evaluatedUs,
           candidate: structuredClone(selected),
@@ -1039,7 +1144,8 @@ export class SimulationEngine {
             this.failure = {
               atUs: this.nowUs,
               code:
-                error instanceof DominantSearchError
+                error instanceof DominantSearchError ||
+                error instanceof ControlTransportError
                   ? error.code
                   : "simulation-failed",
               message: error instanceof Error ? error.message : String(error),
@@ -1084,7 +1190,7 @@ export class SimulationEngine {
       pathValid: this.validPath(),
       length: pathLength(this.installed, p),
       routingAlgorithm: this.strategy.name,
-      mcsr: this.mcsr?.view(),
+      mcsr: this.mcsrView(),
       routingAnalysis: structuredClone(this.analysis),
       currentPathMetrics: this.currentPathMetrics(p),
       routingStages: this.metrics.events
@@ -1115,9 +1221,19 @@ export class SimulationEngine {
       routingAlgorithm: this.strategy.name,
       routingEvaluations: structuredClone(this.routingEvaluations),
       routingAnalyses: structuredClone(this.analyses),
-      ...(this.mcsr ? { mcsr: this.mcsr.exportState() } : {}),
+      ...(this.mcsr
+        ? {
+            mcsr: {
+              ...this.mcsr.exportState(),
+              ...(this.control ? { control: this.control.exportState() } : {}),
+            },
+          }
+        : {}),
       delayModel: {
-        kind: "configured-logical-delays",
+        kind: this.control
+          ? "isl-control-with-configured-processing"
+          : "configured-logical-delays",
+        controlTransport: structuredClone(this.scenario.controlTransport),
         notificationDelayUs: this.scenario.notificationDelayUs,
         computeDelayUs: this.scenario.computeDelayUs,
         switchDelayUs: this.scenario.switchDelayUs,

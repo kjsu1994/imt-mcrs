@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 6,
+  "config": {
+    "planes": 2,
+    "perPlane": 8,
+    "altitude": 2000,
+    "inclination": 90,
+    "phase": 0
+  },
+  "srd": {
+    "planesPerDomain": 1,
+    "satellitesPerDomain": 4
+  },
+  "epochMs": 1767225600000,
+  "durationUs": 4000000,
+  "seed": 1,
+  "source": 0,
+  "target": 12,
+  "slsIntervalUs": 100000,
+  "computeDelayUs": 1000,
+  "installDelayUs": 1000,
+  "notificationDelayUs": 10000,
+  "switchDelayUs": 2000,
+  "failures": [
+    {
+      "atUs": 1000000,
+      "linkId": "0:1",
+      "down": true
+    },
+    {
+      "atUs": 2000000,
+      "linkId": "0:7",
+      "down": true
+    },
+    {
+      "atUs": 3000000,
+      "linkId": "0:1",
+      "down": false
+    }
+  ],
+  "linkMetricUpdates": [
+    {
+      "atUs": 0,
+      "linkId": "0:1",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 100,
+      "jitterMs": 2
+    },
+    {
+      "atUs": 0,
+      "linkId": "0:7",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 300,
+      "jitterMs": 1
+    },
+    {
+      "atUs": 500000,
+      "linkId": "0:1",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 900,
+      "jitterMs": 2
+    }
+  ],
+  "routing": {
+    "algorithm": "mcsr",
+    "service": "TS",
+    "candidatePaths": []
+  }
+}

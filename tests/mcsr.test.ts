@@ -27,6 +27,7 @@ const config = {
 function scenario() {
   const s = createScenario(config, DEFAULT_EPOCH_MS, 0, 12);
   s.routing.algorithm = "mcsr";
+  s.controlTransport.mode = "fixed";
   s.srd = { planesPerDomain: 1, satellitesPerDomain: 4 };
   s.durationUs = 4000000;
   s.notificationDelayUs = 10000;
@@ -195,7 +196,7 @@ test("MCSR engine cached recovery, CSIB trace and replay are deterministic", () 
       ),
   );
 });
-test("v5 migration preserves routing; v6 rejects absent SRD and unsupported scale", () => {
+test("v5 migration preserves routing; v7 rejects absent SRD and unsupported scale", () => {
   const s = scenario();
   const { srd, ...old } = s;
   assert.equal(

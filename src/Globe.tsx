@@ -55,6 +55,8 @@ type Props = {
   links: boolean;
   allOrbits: boolean;
   showSrds: boolean;
+  showControl: boolean;
+  controlPath: number[];
   tracking: boolean;
   home: number;
   onPick: (id: number) => void;
@@ -150,6 +152,13 @@ export default function Globe(props: Props) {
       const packets = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
       ) as PointPrimitiveCollection;
+      const controlPoints = viewer.scene.primitives.add(
+        new PointPrimitiveCollection(),
+      ) as PointPrimitiveCollection;
+      const controlLines = viewer.scene.primitives.add(
+        new PolylineCollection(),
+      ) as PolylineCollection;
+      let controlPathKey = "";
       // Small collections avoid Cesium scanning thousands of earlier lines for every position update.
       const wireGroups: PolylineCollection[] = [];
       const linesPerGroup = 128;
@@ -277,6 +286,9 @@ export default function Globe(props: Props) {
           satelliteIcons.removeAll();
           dsLabels.removeAll();
           packets.removeAll();
+          controlPoints.removeAll();
+          controlLines.removeAll();
+          controlPathKey = "";
           wireGroups.forEach((group) => group.removeAll());
           paths.removeAll();
           previewLines.removeAll();
@@ -503,6 +515,73 @@ export default function Globe(props: Props) {
           previewLines.get(i).positions = srd
             ? [scenePositions[preview[i]], scenePositions[preview[i + 1]]]
             : preview.map((id) => scenePositions[id]);
+        const flights = p.showControl
+          ? (display?.mcsr?.control?.flights ?? [])
+          : [];
+        for (
+          let i = 0;
+          i < Math.max(controlPoints.length, flights.length);
+          i++
+        ) {
+          if (i >= controlPoints.length)
+            controlPoints.add({
+              position: Cartesian3.ZERO,
+              pixelSize: 8,
+              outlineWidth: 1,
+              outlineColor: Color.WHITE,
+            });
+          const dot = controlPoints.get(i),
+            f = flights[i];
+          dot.show = !!f;
+          if (!f) continue;
+          dot.id = `control:${f.kind}:${f.messageId}`;
+          dot.color = Color.fromCssColorString(
+            f.kind === "ack" ? "#db9aff" : "#4eeaff",
+          );
+          const a = f.path[f.hop],
+            b = f.path[f.hop + 1];
+          if (a !== undefined && b !== undefined) {
+            const t = Math.max(
+              0,
+              Math.min(
+                1,
+                (displayClock.at(now) - f.departedUs) /
+                  Math.max(1, f.arrivesUs - f.departedUs),
+              ),
+            );
+            dot.position = Cartesian3.lerp(
+              scenePositions[a],
+              scenePositions[b],
+              t,
+              new Cartesian3(),
+            );
+          } else {
+            const node = display?.mcsr?.domains[f.origin]?.ds;
+            if (node !== undefined) dot.position = scenePositions[node];
+          }
+        }
+        const controlPath =
+            p.showControl &&
+            p.controlPath.every((id) => id >= 0 && id < scenePositions.length)
+              ? p.controlPath
+              : [],
+          controlKey = controlPath.join(":");
+        if (controlKey !== controlPathKey) {
+          controlLines.removeAll();
+          if (controlPath.length > 1) {
+            const line = controlLines.add({
+              positions: controlPath.map((id) => scenePositions[id]),
+              width: 4,
+            });
+            line.material.uniforms.color =
+              Color.fromCssColorString("#ffc477").withAlpha(0.9);
+          }
+          controlPathKey = controlKey;
+        }
+        if (controlLines.length)
+          controlLines.get(0).positions = controlPath.map(
+            (id) => scenePositions[id],
+          );
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
           dot.show = path.length > 1 && !!display?.pathValid;

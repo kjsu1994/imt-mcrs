@@ -14,6 +14,16 @@ import {
 import type { Scenario } from "./engine";
 import { DOMINANT_NODE_LIMIT } from "./routing";
 import type { RoutingSettings } from "./routing";
+import type { ControlEvent, ControlSettings } from "./controlTransport";
+const controlReason = (reason: string) =>
+  ({
+    "no-known-route": "인지된 경로 없음",
+    "link-unavailable": "전송 링크 단절",
+    "link-interrupted": "이동 중 링크 단절",
+    expired: "전달 제한 시간 초과",
+    "ack-timeout": "ACK 제한 시간 초과",
+    "superseded-attempt": "이전 전송의 ACK",
+  })[reason] ?? reason;
 import { useSimulation } from "./useSimulation";
 const initial: Telemetry = { latitude: 0, longitude: 0, altitude: 0 };
 const defaultExperiment = {
@@ -43,6 +53,14 @@ export default function App() {
     [allOrbits, setAllOrbits] = useState(false),
     [tracking, setTracking] = useState(false),
     [showSrds, setShowSrds] = useState(true),
+    [showControl, setShowControl] = useState(true),
+    [controlSelection, setControlSelection] = useState<ControlEvent | null>(
+      null,
+    ),
+    [controlDraft, setControlDraft] = useState<{
+      mode: ControlSettings["mode"];
+      ackTimeoutMs: number;
+    }>({ mode: "isl", ackTimeoutMs: 1000 }),
     [home, setHome] = useState(0),
     [telemetry, setTelemetry] = useState(initial),
     [experiment, setExperiment] = useState(defaultExperiment),
@@ -75,7 +93,30 @@ export default function App() {
   const preview = frame?.routingAnalysis.candidates.find(
     (c) => c.id === previewId,
   );
-  useEffect(() => setPreviewId(""), [scenario]);
+  useEffect(() => {
+    setPreviewId("");
+    setControlSelection(null);
+    setControlDraft({
+      mode: scenario.controlTransport.mode,
+      ackTimeoutMs: scenario.controlTransport.ackTimeoutUs / 1000,
+    });
+  }, [scenario]);
+  function applyControl() {
+    try {
+      const next = {
+        ...structuredClone(frame?.scenario ?? scenario),
+        controlTransport: {
+          mode: controlDraft.mode,
+          ackTimeoutUs: Math.round(controlDraft.ackTimeoutMs * 1000),
+        },
+      };
+      validateScenario(next);
+      setLoadedScenario(next);
+      setInputError("");
+    } catch (e) {
+      setInputError(e instanceof Error ? e.message : String(e));
+    }
+  }
   function updateRouting(routing: RoutingSettings) {
     const next = { ...structuredClone(frame?.scenario ?? scenario), routing };
     validateScenario(next);
@@ -546,6 +587,52 @@ export default function App() {
                       </label>
                     ))}
                   </div>
+                  <label className="field">
+                    제어 통지 모델
+                    <select
+                      aria-label="제어 통지 모델"
+                      value={controlDraft.mode}
+                      onChange={(e) =>
+                        setControlDraft({
+                          ...controlDraft,
+                          mode: e.target.value as ControlSettings["mode"],
+                        })
+                      }
+                    >
+                      <option value="isl">ISL · 홉 전달 + ACK</option>
+                      <option value="fixed">고정 지연 · 이전 모델</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    ACK 제한 시간 (ms)
+                    <input
+                      aria-label="ACK 제한 시간"
+                      type="number"
+                      value={
+                        Number.isNaN(controlDraft.ackTimeoutMs)
+                          ? ""
+                          : controlDraft.ackTimeoutMs
+                      }
+                      onChange={(e) =>
+                        setControlDraft({
+                          ...controlDraft,
+                          ackTimeoutMs:
+                            e.target.value === ""
+                              ? NaN
+                              : Number(e.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                  <button onClick={applyControl}>제어 통신 적용</button>
+                  <label className="toggle">
+                    <input
+                      type="checkbox"
+                      checked={showControl}
+                      onChange={(e) => setShowControl(e.target.checked)}
+                    />
+                    제어 메시지 표시
+                  </label>
                   <label className="toggle">
                     <input
                       type="checkbox"
@@ -615,6 +702,8 @@ export default function App() {
               target={target}
               links={links}
               showSrds={showSrds}
+              showControl={showControl}
+              controlPath={controlSelection?.path ?? []}
               allOrbits={allOrbits}
               tracking={tracking}
               home={home}
@@ -662,6 +751,18 @@ export default function App() {
                 <i className="legend-packet" />
                 패킷
               </span>
+              {showControl && frame?.mcsr?.control && (
+                <>
+                  <span>
+                    <i style={{ background: "#4eeaff" }} />
+                    CSIB
+                  </span>
+                  <span>
+                    <i style={{ background: "#db9aff" }} />
+                    ACK
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </section>
@@ -839,6 +940,92 @@ export default function App() {
                           .join(" · ")}
                       </p>
                     </>
+                  )}
+                  {frame.mcsr.control && (
+                    <div
+                      className="control-summary"
+                      aria-label="제어 통신 상태"
+                    >
+                      <p className="model-caption">
+                        ACK 대기 {frame.mcsr.control.pending.length}건 · 전송 중{" "}
+                        {frame.mcsr.control.flights.length}건 · 재전송{" "}
+                        {frame.mcsr.control.stats.retries}회 · 실패{" "}
+                        {frame.mcsr.control.stats.dropped}건
+                      </p>
+                      <details>
+                        <summary>DS별 전송 대기</summary>
+                        <ol className="event-list">
+                          {frame.mcsr.control.pending.map((p) => (
+                            <li key={`${p.origin}:${p.recipient}`}>
+                              S{p.origin} → S{p.recipient} v{p.revision} · 시도{" "}
+                              {p.attempt} · 제한{" "}
+                              {(p.expiresUs / SECOND).toFixed(6)}초
+                            </li>
+                          ))}
+                        </ol>
+                      </details>
+                      <details>
+                        <summary>제어 메시지 이력 (최근 24건)</summary>
+                        <ol className="event-list">
+                          {frame.mcsr.control.events.map((e, i) => (
+                            <li key={i}>
+                              <button
+                                className="event-jump"
+                                aria-pressed={
+                                  controlSelection?.messageId === e.messageId
+                                }
+                                onClick={() => {
+                                  setControlSelection(e);
+                                  setPlaying(false);
+                                  setSelected(
+                                    frame.mcsr!.domains[e.recipient].ds,
+                                  );
+                                  if (e.path[e.hop + 1] !== undefined)
+                                    setSelectedLink(
+                                      edgeId(e.path[e.hop], e.path[e.hop + 1]),
+                                    );
+                                  jump(e.atUs / SECOND);
+                                }}
+                              >
+                                {(e.atUs / SECOND).toFixed(6)}초 · #
+                                {e.messageId}{" "}
+                                {e.kind === "ack" ? "ACK" : "CSIB"} S{e.origin}{" "}
+                                → S{e.recipient} v{e.revision} ·{" "}
+                                {
+                                  {
+                                    sent: "발신",
+                                    "hop-started": "홉 출발",
+                                    "hop-arrived": "홉 도착",
+                                    delivered: "전달",
+                                    applied: "갱신 적용",
+                                    duplicate: "중복·이전 버전",
+                                    dropped: "전달 실패",
+                                    expired: "만료",
+                                    timeout: "ACK 시간초과",
+                                    acknowledged: "ACK 확인",
+                                    "ack-ignored": "이전 ACK 제외",
+                                  }[e.type]
+                                }
+                                {e.reason
+                                  ? ` · ${controlReason(e.reason)}`
+                                  : ""}
+                              </button>
+                            </li>
+                          ))}
+                        </ol>
+                      </details>
+                      {controlSelection && (
+                        <p className="model-caption">
+                          선택 #{controlSelection.messageId} ·{" "}
+                          {controlSelection.path.join(" → ") ||
+                            "인지된 경로 없음"}{" "}
+                          ·{" "}
+                          {controlSelection.reason
+                            ? controlReason(controlSelection.reason)
+                            : controlSelection.type}
+                        </p>
+                      )}
+                    </div>
                   )}
                   <details>
                     <summary>DS·CSIB 수신 상태</summary>
@@ -1154,11 +1341,29 @@ export default function App() {
                           : `관련 링크 ${r.causeLinkIds.join(", ") || "—"}`}
                       </small>
                       <small>
+                        출발 영역 인지{" "}
+                        {r.sourceNotificationUs === null
+                          ? "—"
+                          : `${(r.sourceNotificationUs / 1000).toFixed(3)} ms`}{" "}
+                        · 인지 후 복구{" "}
+                        {r.informedEstablishmentUs === null
+                          ? "—"
+                          : `${(r.informedEstablishmentUs / 1000).toFixed(3)} ms`}{" "}
+                        · 복구 방식{" "}
+                        {r.recoveryMechanism === "reserve"
+                          ? "예비 전환"
+                          : r.recoveryMechanism === "recalculate"
+                            ? "재계산"
+                            : r.recoveryMechanism === "physical-restoration"
+                              ? "물리 링크 복원"
+                              : "—"}
+                      </small>
+                      <small>
                         감지{" "}
                         {r.detectionUs === null
                           ? "—"
                           : `${(r.detectionUs / 1000).toFixed(3)} ms`}{" "}
-                        · 인지 후 수립{" "}
+                        · 감지 후 복구{" "}
                         {r.establishmentUs === null
                           ? "—"
                           : `${(r.establishmentUs / 1000).toFixed(3)} ms`}

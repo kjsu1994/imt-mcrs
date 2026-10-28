@@ -94,6 +94,7 @@ export interface CsibEvent {
 }
 export interface McsrView {
   sourceDomain: number;
+  control?: import("./controlTransport").ControlView;
   membership: number[];
   domains: (SrdDomain & { revision: number; receivedVersions: number[] })[];
   events: CsibEvent[];
@@ -140,7 +141,6 @@ function abort(
 ): never {
   throw new DominantSearchError(code, message, structuredClone(search));
 }
-// shortcut: reliable direct DS broadcasts use configured delays; model control transport when packet-level validation is needed.
 export class McsrController {
   readonly partition: SrdPartition;
   readonly sourceDomain: number;
@@ -319,9 +319,9 @@ export class McsrController {
       })),
     };
   }
-  graph(): RoutingGraph {
+  graph(domainId = this.sourceDomain): RoutingGraph {
     const links = new Map<string, NetworkLink>();
-    const ads = this.csibs[this.sourceDomain];
+    const ads = this.csibs[domainId];
     for (const ad of ads) {
       for (const segment of ad.segments)
         for (const hop of segment.hops) links.set(hop.id, hop);
@@ -330,8 +330,8 @@ export class McsrController {
         const a = this.partition.membership[l.sourceId],
           b = this.partition.membership[l.targetId];
         const newer =
-          this.sourceDomain === a || this.sourceDomain === b
-            ? this.sourceDomain
+          domainId === a || domainId === b
+            ? domainId
             : ads[a].atUs > ads[b].atUs
               ? a
               : ads[b].atUs > ads[a].atUs

@@ -7,14 +7,21 @@ test("MCSR regions, decisions, delayed CSIB, event seek and exported core replay
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
+  async function loadFixed() {
+    await page
+      .getByLabel("시나리오 가져오기", { exact: true })
+      .setInputFiles({
+        name: "mcsr-fixed-routing.json",
+        mimeType: "application/json",
+        buffer: await readFile("examples/mcsr-fixed-routing.json"),
+      });
+  }
   await page.goto("/");
   await expect(page.locator('option[value="mcsr"]')).toHaveJSProperty(
     "disabled",
     true,
   );
-  await page
-    .getByRole("button", { name: "MCSR 예제 불러오기 · 16기", exact: true })
-    .click();
+  await loadFixed();
   await expect(page.getByLabel("라우팅 알고리즘", { exact: true })).toHaveValue(
     "mcsr",
   );
@@ -64,9 +71,7 @@ test("MCSR regions, decisions, delayed CSIB, event seek and exported core replay
   );
   await page.getByLabel("SRD 슬롯 수", { exact: true }).selectOption("8");
   await expect(page.locator(".mcsr-summary")).toContainText("SRD 2개");
-  await page
-    .getByRole("button", { name: "MCSR 예제 불러오기 · 16기", exact: true })
-    .click();
+  await loadFixed();
   await expect(page.locator(".mcsr-summary")).toContainText("SRD 4개");
   await page.locator(".mcsr-summary").scrollIntoViewIfNeeded();
   await page.screenshot({ path: "test-results/mcsr-regions.png" });
@@ -77,9 +82,7 @@ test("MCSR regions, decisions, delayed CSIB, event seek and exported core replay
       raf(() => setTimeout(() => callback(performance.now()), 200));
   });
   await page.reload();
-  await page
-    .getByRole("button", { name: "MCSR 예제 불러오기 · 16기", exact: true })
-    .click();
+  await loadFixed();
   await expect(page.locator(".run-status")).toHaveText("일시정지");
   await page.getByRole("button", { name: "끝까지 실행", exact: true }).click();
   await expect(page.locator(".run-status")).toHaveText("종료");

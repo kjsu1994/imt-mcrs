@@ -801,3 +801,14 @@ input[type="file"] {
   overflow-wrap: anywhere;
   padding: 4px;
 }
+
+.srd-settings > .toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0;
+}
+.srd-settings > button {
+  width: 100%;
+  margin-top: 6px;
+}

@@ -1,3 +1,4 @@
+import type { RoutingGraph } from "./routing";
 export type RecordEntry = {
   atUs: number;
   type: string;
@@ -26,6 +27,8 @@ export type ServiceOutage = {
   startedUs: number;
   recoveredUs: number | null;
   detectedUs: number | null;
+  sourceInformedUs: number | null;
+  recoveryMechanism: "reserve" | "recalculate" | "physical-restoration" | null;
   reason: "initial-unreachable" | "path-unavailable";
   causeLinkIds: string[];
   previousPath: number[];
@@ -76,6 +79,8 @@ export class MetricsEngine {
     available: boolean,
     missing: string[],
     detected: Set<string>,
+    knownGraph?: RoutingGraph,
+    installedMode: "initial" | "reserve" | "recalculate" | null = null,
   ) {
     if (!available && !this.open) {
       this.open = {
@@ -85,6 +90,8 @@ export class MetricsEngine {
         startedUs: atUs,
         recoveredUs: null,
         detectedUs: null,
+        sourceInformedUs: null,
+        recoveryMechanism: null,
         reason: atUs === 0 ? "initial-unreachable" : "path-unavailable",
         causeLinkIds: [],
         previousPath: [...path],
@@ -107,8 +114,21 @@ export class MetricsEngine {
       outage.causeLinkIds.some((id) => detected.has(id))
     )
       outage.detectedUs = atUs;
+    if (
+      outage.sourceInformedUs === null &&
+      knownGraph &&
+      outage.causeLinkIds.some(
+        (id) => !knownGraph.links.some((l) => l.id === id && l.knownAvailable),
+      )
+    )
+      outage.sourceInformedUs = atUs;
     if (available) {
       outage.recoveredUs = atUs;
+      outage.recoveryMechanism =
+        (installedMode === "reserve" || installedMode === "recalculate") &&
+        path.join(":") !== outage.previousPath.join(":")
+          ? installedMode
+          : "physical-restoration";
       outage.restoredPath = [...path];
       this.record({
         atUs,
@@ -139,6 +159,12 @@ export class MetricsEngine {
               : "pending",
         durationUs: (o.recoveredUs ?? timeUs) - o.startedUs,
         recoveryUs: o.recoveredUs === null ? null : o.recoveredUs - o.startedUs,
+        sourceNotificationUs:
+          o.sourceInformedUs === null ? null : o.sourceInformedUs - o.startedUs,
+        informedEstablishmentUs:
+          o.sourceInformedUs === null || o.recoveredUs === null
+            ? null
+            : o.recoveredUs - o.sourceInformedUs,
         detectionUs: o.detectedUs === null ? null : o.detectedUs - o.startedUs,
         establishmentUs:
           o.recoveredUs === null || o.detectedUs === null

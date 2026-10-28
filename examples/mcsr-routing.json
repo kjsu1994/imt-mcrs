@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 6,
+  "schemaVersion": 7,
   "config": {
     "planes": 2,
     "perPlane": 8,
@@ -12,7 +12,7 @@
     "satellitesPerDomain": 4
   },
   "epochMs": 1767225600000,
-  "durationUs": 4000000,
+  "durationUs": 8000000,
   "seed": 1,
   "source": 0,
   "target": 12,
@@ -24,17 +24,17 @@
   "failures": [
     {
       "atUs": 1000000,
-      "linkId": "0:1",
+      "linkId": "10:11",
       "down": true
     },
     {
       "atUs": 2000000,
-      "linkId": "0:7",
+      "linkId": "13:14",
       "down": true
     },
     {
       "atUs": 3000000,
-      "linkId": "0:1",
+      "linkId": "10:11",
       "down": false
     }
   ],
@@ -52,18 +52,15 @@
       "bufferCapacityPackets": 1000,
       "queuedPackets": 300,
       "jitterMs": 1
-    },
-    {
-      "atUs": 500000,
-      "linkId": "0:1",
-      "bufferCapacityPackets": 1000,
-      "queuedPackets": 900,
-      "jitterMs": 2
     }
   ],
   "routing": {
     "algorithm": "mcsr",
     "service": "TS",
     "candidatePaths": []
+  },
+  "controlTransport": {
+    "mode": "isl",
+    "ackTimeoutUs": 500000
   }
 }
