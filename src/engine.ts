@@ -10,6 +10,8 @@ import type { Config } from "./model";
 import { MetricsEngine } from "./metrics";
 import {
   createRoutingStrategy,
+  DominantSearchError,
+  DOMINANT_NODE_LIMIT,
   validateCandidates,
   pathProblem,
   analyseCandidates,
@@ -26,14 +28,15 @@ import type {
   PathCandidate,
   RoutingSettings,
   RoutingAnalysis,
+  DominantSearchSummary,
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "routing-runtime-v4";
+export const MODEL_VERSION = "dominant-reference-v5";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 4;
+  schemaVersion: 5;
   config: Config;
   epochMs: number;
   durationUs: number;
@@ -66,7 +69,7 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     config: { ...config },
     epochMs,
     durationUs: 86400 * SECOND,
@@ -92,13 +95,19 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 1 &&
     version !== 2 &&
     version !== 3 &&
-    version !== 4
+    version !== 4 &&
+    version !== 5
   )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 4 } as Scenario;
-  if (version !== 3 && scenario.linkMetricUpdates === undefined)
+  const scenario = { ...structuredClone(input), schemaVersion: 5 } as Scenario;
+  if (
+    version !== 3 &&
+    version !== 4 &&
+    version !== 5 &&
+    scenario.linkMetricUpdates === undefined
+  )
     scenario.linkMetricUpdates = [];
-  if (version !== 4) {
+  if (version !== 4 && version !== 5) {
     scenario.routing ??= {
       algorithm: "bfs",
       service: "LS",
@@ -138,7 +147,7 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 4)
+  if (s.schemaVersion !== 5)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
@@ -158,11 +167,18 @@ export function validateScenario(s: Scenario) {
   integer(s.switchDelayUs, 0, s.durationUs, "예비 전환 지연");
   if (
     !s.routing ||
-    !["bfs", "candidate-paths"].includes(s.routing.algorithm) ||
+    !["bfs", "candidate-paths", "dominant-paths"].includes(
+      s.routing.algorithm,
+    ) ||
     !["LS", "TS", "HR"].includes(s.routing.service) ||
     !Array.isArray(s.routing.candidatePaths)
   )
     throw new Error("잘못된 라우팅 설정입니다.");
+  if (
+    s.routing.algorithm === "dominant-paths" &&
+    s.config.planes * s.config.perPlane > DOMINANT_NODE_LIMIT
+  )
+    throw new Error("자동 우세 경로는 16기 이하 성좌를 적용한 뒤 선택하세요.");
   const structuralGraph: RoutingGraph = {
     nodeCount: s.config.planes * s.config.perPlane,
     links: mesh(s.config).map(([a, b]) => ({
@@ -277,12 +293,19 @@ export class SimulationEngine {
     evaluatedUs: number;
     inputRevision: number;
     candidates: PathCandidate[];
+    search?: DominantSearchSummary;
   }[] = [];
+  failure: {
+    atUs: number;
+    code: string;
+    message: string;
+    search?: DominantSearchSummary;
+  } | null = null;
   private strategy: RoutingStrategy;
   private inputRevision = 0;
   private requestAtUs = -1;
   private requestedVersion = -1;
-  private pendingTrigger = "";
+
   private cachedCandidates: PathCandidate[] = [];
   private analyses: RoutingAnalysis[] = [];
   private analysis!: RoutingAnalysis;
@@ -332,7 +355,13 @@ export class SimulationEngine {
     }
     const initial = this.calculate();
     this.cachedCandidates = initial.candidates;
-    const chosen = this.decide(initial.candidates, "initial", "initial");
+    const chosen = this.decide(
+      initial.candidates,
+      "initial",
+      "initial",
+      [],
+      initial.search,
+    );
     this.installed = chosen?.nodes ?? [];
     this.installedEvaluation = {
       evaluatedUs: initial.evaluatedUs,
@@ -654,12 +683,18 @@ export class SimulationEngine {
     const graph = this.graph();
     const started = performance.now();
     let candidates: PathCandidate[];
+    let search: DominantSearchSummary | undefined;
     try {
       const raw = this.strategy.calculate(
         structuredClone(graph),
         this.scenario.source,
         this.scenario.target,
+        (summary) => {
+          search = structuredClone(summary);
+        },
       );
+      if (search && !search.complete)
+        throw new Error("완료되지 않은 경로 탐색 결과입니다.");
       candidates = validateCandidates(
         raw,
         graph,
@@ -672,9 +707,25 @@ export class SimulationEngine {
           type: "candidate-duplicates-removed",
         });
     } catch (error) {
+      this.failure = {
+        atUs: this.nowUs,
+        code:
+          error instanceof DominantSearchError
+            ? error.code
+            : "invalid-routing-result",
+        message: error instanceof Error ? error.message : String(error),
+        ...(error instanceof DominantSearchError
+          ? { search: structuredClone(error.search) }
+          : {}),
+      };
       this.metrics.record({
         atUs: this.nowUs,
-        type: "routing-validation-failed",
+        type:
+          error instanceof DominantSearchError
+            ? "routing-search-aborted"
+            : "routing-validation-failed",
+        reason: this.failure.code,
+        inputRevision: this.inputRevision,
       });
       throw error;
     }
@@ -686,6 +737,7 @@ export class SimulationEngine {
       evaluatedUs: this.nowUs,
       inputRevision: this.inputRevision,
       candidates: structuredClone(candidates),
+      ...(search ? { search } : {}),
     };
     this.routingEvaluations.push(evaluation);
     return evaluation;
@@ -695,6 +747,7 @@ export class SimulationEngine {
     mode: RoutingAnalysis["mode"],
     trigger: string,
     unavailable: PathCandidate[] = [],
+    search?: DominantSearchSummary,
   ): PathCandidate | null {
     const { selected, decisions } = analyseCandidates(
       candidates,
@@ -719,6 +772,7 @@ export class SimulationEngine {
       trigger,
       selectedId: selected ? candidateId(selected.nodes) : null,
       candidates: decisions,
+      ...(search ? { search: structuredClone(search) } : {}),
     };
     this.analyses.push(structuredClone(this.analysis));
     this.metrics.record({
@@ -753,7 +807,11 @@ export class SimulationEngine {
     const revision = this.inputRevision,
       version = this.version;
     const graph = this.graph();
-    let evaluation: { evaluatedUs: number; candidates: PathCandidate[] };
+    let evaluation: {
+      evaluatedUs: number;
+      candidates: PathCandidate[];
+      search?: DominantSearchSummary;
+    };
     let mode: RoutingAnalysis["mode"] = "recalculate";
     let unavailable: PathCandidate[] = [];
     if (trigger === "link-down") {
@@ -775,6 +833,7 @@ export class SimulationEngine {
       mode,
       trigger,
       unavailable,
+      evaluation.search,
     );
     const decisionId = this.analysis.id;
     const path = selected?.nodes ?? [];
@@ -865,6 +924,7 @@ export class SimulationEngine {
     });
   }
   advanceTo(targetUs: number, budget = Infinity) {
+    if (this.failure) throw new Error(this.failure.message);
     integer(targetUs, this.nowUs, this.scenario.durationUs, "진행 시각");
     if (!(budget >= 1))
       throw new Error("사건 처리 묶음은 1 이상이어야 합니다.");
@@ -887,6 +947,7 @@ export class SimulationEngine {
     return done;
   }
   step() {
+    if (this.failure) throw new Error(this.failure.message);
     const next = this.queue.peek();
     if (next) this.advanceTo(next.atUs);
     else this.nowUs = this.scenario.durationUs;
@@ -898,6 +959,7 @@ export class SimulationEngine {
       this.scenario.epochMs,
     );
     return {
+      failure: structuredClone(this.failure),
       timeUs: this.nowUs,
       version: this.version,
       stateRevision: this.stateRevision,
@@ -917,7 +979,7 @@ export class SimulationEngine {
       physicalLinkCount: this.physical.size,
       ...this.metrics.summary(
         this.nowUs,
-        this.nowUs === this.scenario.durationUs,
+        !this.failure && this.nowUs === this.scenario.durationUs,
         6,
       ),
     };
@@ -951,11 +1013,13 @@ export class SimulationEngine {
         ),
       ),
       timeUs: this.nowUs,
-      completed: this.nowUs === this.scenario.durationUs,
+      completed: !this.failure && this.nowUs === this.scenario.durationUs,
+      validForAnalysis: !this.failure,
+      failure: structuredClone(this.failure),
       path: [...this.installed],
       ...this.metrics.result(
         this.nowUs,
-        this.nowUs === this.scenario.durationUs,
+        !this.failure && this.nowUs === this.scenario.durationUs,
       ),
     };
   }

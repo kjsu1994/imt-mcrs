@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 5,
+  "config": {
+    "planes": 1,
+    "perPlane": 8,
+    "altitude": 2000,
+    "inclination": 0,
+    "phase": 0
+  },
+  "epochMs": 1767225600000,
+  "durationUs": 4000000,
+  "seed": 1,
+  "source": 0,
+  "target": 3,
+  "slsIntervalUs": 100000,
+  "computeDelayUs": 10000,
+  "installDelayUs": 1000,
+  "notificationDelayUs": 10000,
+  "switchDelayUs": 0,
+  "routing": {
+    "algorithm": "dominant-paths",
+    "service": "TS",
+    "candidatePaths": []
+  },
+  "failures": [
+    {
+      "atUs": 1000000,
+      "linkId": "0:7",
+      "down": true
+    },
+    {
+      "atUs": 2000000,
+      "linkId": "0:1",
+      "down": true
+    }
+  ],
+  "linkMetricUpdates": [
+    {
+      "atUs": 0,
+      "linkId": "0:1",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 100,
+      "jitterMs": 2
+    },
+    {
+      "atUs": 0,
+      "linkId": "0:7",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 300,
+      "jitterMs": 1
+    },
+    {
+      "atUs": 500000,
+      "linkId": "0:1",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 900,
+      "jitterMs": 2
+    }
+  ]
+}

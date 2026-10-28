@@ -24,7 +24,8 @@ function send(reset = false, verify = false) {
   if (!engine) return;
   const now = performance.now();
   const { serviceOutages, linkFailures, ...progress } = engine.progress();
-  const completed = engine.nowUs === engine.scenario.durationUs;
+  const completed =
+    !engine.failure && engine.nowUs === engine.scenario.durationUs;
   const checkpoint =
     reset || verify || now - lastCheckpoint >= 5000
       ? engine.checkpoint()
@@ -60,17 +61,20 @@ function fail(error: unknown, stop = true) {
   if (stop) {
     playing = false;
     target = null;
+    if (engine?.failure) send(true);
   }
   port.postMessage({
     type: "error",
     runId,
     message: error instanceof Error ? error.message : String(error),
+    fatal: stop,
   });
 }
 port.onmessage = ({ data: c }) => {
   try {
     if (c.type === "load") {
       runId = c.runId;
+      engine = null;
       const next = new SimulationEngine(c.scenario);
       engine = next;
       playing = c.playing;
@@ -85,6 +89,8 @@ port.onmessage = ({ data: c }) => {
       case "play":
         if (![1, 10, 60, 300].includes(c.speed))
           throw new Error("지원하지 않는 배속입니다.");
+        if (engine.failure && c.playing)
+          throw new Error(engine.failure.message);
         playing = c.playing;
         speed = c.speed;
         anchor();
@@ -97,8 +103,10 @@ port.onmessage = ({ data: c }) => {
           c.atUs > engine.scenario.durationUs
         )
           throw new Error("잘못된 탐색 시각입니다.");
-        engine = new SimulationEngine(engine.scenario);
+        const scenario = engine.scenario;
         runId = c.nextRunId;
+        engine = null;
+        engine = new SimulationEngine(scenario);
         target = c.atUs;
         anchor();
         send(true);
@@ -148,7 +156,7 @@ port.onmessage = ({ data: c }) => {
         break;
     }
   } catch (error) {
-    fail(error, false);
+    fail(error, c.type === "load" || c.type === "seek" || !!engine?.failure);
   }
 };
 function pump() {

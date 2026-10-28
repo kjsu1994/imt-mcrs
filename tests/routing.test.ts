@@ -107,7 +107,7 @@ test("v4 validation and legacy migration preserve deterministic defaults", () =>
       ...(version === undefined ? {} : { schemaVersion: version }),
       ...(version === 3 ? { linkMetricUpdates: [] } : {}),
     });
-    assert.equal(s.schemaVersion, 4);
+    assert.equal(s.schemaVersion, 5);
     assert.deepEqual(s.linkMetricUpdates, []);
   }
   for (const bad of [

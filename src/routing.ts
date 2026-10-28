@@ -39,6 +39,7 @@ export interface RoutingStrategy {
     graph: RoutingGraph,
     source: number,
     target: number,
+    reportSearch?: (summary: DominantSearchSummary) => void,
   ): PathCandidate[];
 }
 export function linkMetrics(
@@ -105,7 +106,7 @@ export const bfsStrategy: RoutingStrategy = {
 
 export type ServiceType = "LS" | "TS" | "HR";
 export type RoutingSettings = {
-  algorithm: "bfs" | "candidate-paths";
+  algorithm: "bfs" | "candidate-paths" | "dominant-paths";
   service: ServiceType;
   candidatePaths: number[][];
 };
@@ -128,6 +129,7 @@ export type RoutingAnalysis = {
   trigger: string;
   selectedId: string | null;
   candidates: CandidateDecision[];
+  search?: DominantSearchSummary;
 };
 export const candidateId = (nodes: number[]) => nodes.join(":");
 export function pathProblem(
@@ -254,6 +256,12 @@ export function createRoutingStrategy(
   settings: RoutingSettings,
 ): RoutingStrategy {
   if (settings.algorithm === "bfs") return bfsStrategy;
+  if (settings.algorithm === "dominant-paths")
+    return {
+      name: "Dominant paths (reference)",
+      reactsToMetrics: true,
+      calculate: findDominantPaths,
+    };
   return {
     name: "Configured candidates",
     reactsToMetrics: true,
@@ -263,4 +271,163 @@ export function createRoutingStrategy(
         .map((nodes) => evaluatePath(nodes, graph.links)!);
     },
   };
+}
+
+export const DOMINANT_NODE_LIMIT = 16;
+export const DOMINANT_EXPANSION_LIMIT = 100000;
+export const DOMINANT_CANDIDATE_LIMIT = 2048;
+export interface DominantSearchSummary {
+  complete: boolean;
+  expandedStates: number;
+  completedPaths: number;
+  frontierSize: number;
+  removedPaths: number;
+  prunedSamples: { candidate: PathCandidate; dominatedBy: string }[];
+}
+export class DominantSearchError extends Error {
+  constructor(
+    public readonly code:
+      "node-limit" | "expansion-limit" | "candidate-limit" | "invalid-graph",
+    message: string,
+    public readonly search: DominantSearchSummary,
+  ) {
+    super(message);
+    this.name = "DominantSearchError";
+  }
+}
+// Reference search for small graphs; no prefix pruning that could discard distinct spare paths.
+export function findDominantPaths(
+  graph: RoutingGraph,
+  source: number,
+  target: number,
+  reportSearch?: (summary: DominantSearchSummary) => void,
+): PathCandidate[] {
+  const summary: DominantSearchSummary = {
+    complete: false,
+    expandedStates: 0,
+    completedPaths: 0,
+    frontierSize: 0,
+    removedPaths: 0,
+    prunedSamples: [],
+  };
+  let frontier: PathCandidate[] = [];
+  const abort = (code: DominantSearchError["code"], message: string): never => {
+    summary.frontierSize = frontier.length;
+    throw new DominantSearchError(code, message, structuredClone(summary));
+  };
+  if (!Number.isInteger(graph.nodeCount) || graph.nodeCount < 1)
+    abort("invalid-graph", "잘못된 그래프 노드 수입니다.");
+  if (graph.nodeCount > DOMINANT_NODE_LIMIT)
+    abort("node-limit", "자동 우세 경로는 16기 이하에서 지원합니다.");
+  if (
+    !Number.isInteger(source) ||
+    !Number.isInteger(target) ||
+    source < 0 ||
+    target < 0 ||
+    source >= graph.nodeCount ||
+    target >= graph.nodeCount
+  )
+    abort("invalid-graph", "출발·도착 노드 범위가 잘못되었습니다.");
+  const adjacent: { node: number; metrics: LinkMetrics }[][] = Array.from(
+    { length: graph.nodeCount },
+    () => [],
+  );
+  const seen = new Set<string>();
+  for (const link of graph.links) {
+    const a = link.sourceId,
+      b = link.targetId,
+      m = link.metrics,
+      key = pairId(a, b);
+    if (
+      !Number.isInteger(a) ||
+      !Number.isInteger(b) ||
+      a < 0 ||
+      b < 0 ||
+      a >= graph.nodeCount ||
+      b >= graph.nodeCount ||
+      a === b ||
+      seen.has(key) ||
+      typeof link.knownAvailable !== "boolean" ||
+      !m ||
+      ![m.propagationDelayMs, m.availableBufferRatio, m.jitterMs].every(
+        Number.isFinite,
+      ) ||
+      m.propagationDelayMs < 0 ||
+      m.availableBufferRatio < 0 ||
+      m.availableBufferRatio > 1 ||
+      m.jitterMs < 0
+    )
+      abort("invalid-graph", "잘못되었거나 중복된 그래프 링크입니다.");
+    seen.add(key);
+    if (link.knownAvailable) {
+      adjacent[a].push({ node: b, metrics: m });
+      adjacent[b].push({ node: a, metrics: m });
+    }
+  }
+  adjacent.forEach((neighbors) => neighbors.sort((a, b) => a.node - b.node));
+  const removed = (candidate: PathCandidate, by: PathCandidate) => {
+    summary.removedPaths++;
+    if (summary.prunedSamples.length < 20)
+      summary.prunedSamples.push({
+        candidate: structuredClone(candidate),
+        dominatedBy: candidateId(by.nodes),
+      });
+  };
+  const nodes = [source],
+    visited = new Set(nodes);
+  function visit(node: number, metrics: LinkMetrics) {
+    if (node === target) {
+      summary.completedPaths++;
+      const candidate: PathCandidate = { nodes: [...nodes], ...metrics };
+      const dominator = frontier.find((other) => dominates(other, candidate));
+      if (dominator) {
+        removed(candidate, dominator);
+        return;
+      }
+      frontier = frontier.filter((other) => {
+        if (dominates(candidate, other)) {
+          removed(other, candidate);
+          return false;
+        }
+        return true;
+      });
+      if (frontier.length >= DOMINANT_CANDIDATE_LIMIT)
+        abort(
+          "candidate-limit",
+          "자동 우세 경로 후보 한도(2,048개)를 초과했습니다. 부분 결과는 사용하지 않습니다.",
+        );
+      frontier.push(candidate);
+      return;
+    }
+    for (const next of adjacent[node]) {
+      if (visited.has(next.node)) continue;
+      if (summary.expandedStates >= DOMINANT_EXPANSION_LIMIT)
+        abort(
+          "expansion-limit",
+          "자동 우세 경로 탐색 한도(100,000회)를 초과했습니다. 부분 결과는 사용하지 않습니다.",
+        );
+      summary.expandedStates++;
+      visited.add(next.node);
+      nodes.push(next.node);
+      visit(next.node, extendMetrics(metrics, next.metrics));
+      nodes.pop();
+      visited.delete(next.node);
+    }
+  }
+  visit(source, {
+    propagationDelayMs: 0,
+    availableBufferRatio: 1,
+    jitterMs: 0,
+  });
+  frontier.sort((a, b) =>
+    candidateId(a.nodes) < candidateId(b.nodes)
+      ? -1
+      : candidateId(a.nodes) > candidateId(b.nodes)
+        ? 1
+        : 0,
+  );
+  summary.complete = true;
+  summary.frontierSize = frontier.length;
+  reportSearch?.(structuredClone(summary));
+  return frontier;
 }

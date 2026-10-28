@@ -39,7 +39,7 @@ export type Reply =
       busy: boolean;
       playing: boolean;
     }
-  | { type: "error"; runId: number; message: string }
+  | { type: "error"; runId: number; message: string; fatal?: boolean }
   | {
       type: "export";
       runId: number;

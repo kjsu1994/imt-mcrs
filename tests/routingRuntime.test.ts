@@ -329,7 +329,7 @@ test("v4 routing configuration rejects unknown algorithms, invalid templates and
       ...old,
       ...(version === undefined ? {} : { schemaVersion: version }),
     });
-    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.schemaVersion, 5);
     assert.equal(migrated.routing.algorithm, "bfs");
     assert.equal(migrated.switchDelayUs, 0);
   }

@@ -11,6 +11,7 @@ import {
   DEFAULT_EPOCH_MS,
 } from "./engine";
 import type { Scenario } from "./engine";
+import { DOMINANT_NODE_LIMIT } from "./routing";
 import type { RoutingSettings } from "./routing";
 import { useSimulation } from "./useSimulation";
 const initial: Telemetry = { latitude: 0, longitude: 0, altitude: 0 };
@@ -66,8 +67,8 @@ export default function App() {
   );
   const simulation = useSimulation(scenario, playing, speed);
   useEffect(() => {
-    if (simulation.ended) setPlaying(false);
-  }, [simulation.ended]);
+    if (simulation.ended || simulation.failed) setPlaying(false);
+  }, [simulation.ended, simulation.failed]);
   const frame = simulation.frame;
   const preview = frame?.routingAnalysis.candidates.find(
     (c) => c.id === previewId,
@@ -400,7 +401,7 @@ export default function App() {
               </button>
               <div className="button-row">
                 <button
-                  disabled={simulation.busy}
+                  disabled={simulation.busy || simulation.failed}
                   onClick={() => {
                     setPlaying(false);
                     simulation.step();
@@ -409,7 +410,7 @@ export default function App() {
                   다음 사건
                 </button>
                 <button
-                  disabled={simulation.busy}
+                  disabled={simulation.busy || simulation.failed}
                   onClick={() => {
                     setPlaying(false);
                     simulation.finish();
@@ -457,10 +458,23 @@ export default function App() {
                     updateRouting({
                       ...scenario.routing,
                       algorithm: e.target.value as RoutingSettings["algorithm"],
+                      candidatePaths:
+                        e.target.value === "candidate-paths"
+                          ? scenario.routing.candidatePaths
+                          : [],
                     })
                   }
                 >
                   <option value="bfs">BFS · 최단 홉</option>
+                  <option
+                    value="dominant-paths"
+                    disabled={config.planes * config.perPlane > DOMINANT_NODE_LIMIT}
+                  >
+                    자동 우세 경로 · 검증용
+                    {config.planes * config.perPlane > DOMINANT_NODE_LIMIT
+                      ? " (16기 이하 필요)"
+                      : ""}
+                  </option>
                   <option value="candidate-paths">
                     수동 후보 · MCSR 미적용
                   </option>
@@ -686,7 +700,9 @@ export default function App() {
               >
                 {frame?.routingAlgorithm === "BFS"
                   ? "최단 홉 · 시각화"
-                  : "수동 후보 · 시각화"}
+                  : scenario.routing.algorithm === "dominant-paths"
+                    ? "자동 우세 경로 · 검증용"
+                    : "수동 후보 · 시각화"}
               </span>
             </section>
             <section
@@ -694,6 +710,11 @@ export default function App() {
               aria-label="라우팅 판단"
             >
               <h2>경로 후보</h2>
+              {simulation.failed && (
+                <p className="model-caption" role="status">
+                  계산 실패 · 표시된 이전 경로는 분석에 사용할 수 없습니다.
+                </p>
+              )}
               <p className="model-caption">
                 {frame
                   ? (
@@ -717,6 +738,45 @@ export default function App() {
                   ? ` · ${(frame.routingAnalysis.atUs / SECOND).toFixed(3)}초`
                   : ""}
               </p>
+              {frame?.routingAnalysis.search && (
+                <div
+                  className="search-summary"
+                  aria-label="자동 경로 탐색 요약"
+                >
+                  <p className="model-caption">
+                    탐색{" "}
+                    {frame.routingAnalysis.search.expandedStates.toLocaleString()}
+                    회 · 완성{" "}
+                    {frame.routingAnalysis.search.completedPaths.toLocaleString()}
+                    개 · 우세 {frame.routingAnalysis.search.frontierSize}개 ·
+                    제거 {frame.routingAnalysis.search.removedPaths}개
+                  </p>
+                  {!!frame.routingAnalysis.search.prunedSamples.length && (
+                    <details>
+                      <summary>제거 사례 (최대 20건)</summary>
+                      <ol className="event-list">
+                        {frame.routingAnalysis.search.prunedSamples.map(
+                          (sample, i) => (
+                            <li key={i}>
+                              {sample.candidate.nodes.join(" → ")}
+                              <br />D{" "}
+                              {sample.candidate.propagationDelayMs.toFixed(2)}ms
+                              · A{" "}
+                              {(
+                                sample.candidate.availableBufferRatio * 100
+                              ).toFixed(1)}
+                              % · J {sample.candidate.jitterMs.toFixed(2)}ms
+                              <br />
+                              우세 경로{" "}
+                              {sample.dominatedBy.replaceAll(":", " → ")}
+                            </li>
+                          ),
+                        )}
+                      </ol>
+                    </details>
+                  )}
+                </div>
+              )}
               {frame?.routingAnalysis.candidates.map((c) => (
                 <button
                   className={
@@ -1028,6 +1088,7 @@ export default function App() {
           <button
             aria-label={playing ? "일시정지" : "재생"}
             className="play"
+            disabled={simulation.failed}
             onClick={() => {
               if (simulation.ended) {
                 jump(0);
@@ -1091,13 +1152,15 @@ export default function App() {
           </div>
         </div>
         <span className="run-status">
-          {simulation.busy
-            ? "계산 중"
-            : simulation.ended
-              ? "종료"
-              : playing
-                ? "재생 중"
-                : "일시정지"}
+          {simulation.failed
+            ? "계산 실패"
+            : simulation.busy
+              ? "계산 중"
+              : simulation.ended
+                ? "종료"
+                : playing
+                  ? "재생 중"
+                  : "일시정지"}
         </span>
       </footer>
       {(error || simulation.error) && (

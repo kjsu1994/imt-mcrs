@@ -254,14 +254,14 @@ test("geometry and forced restoration at 106 seconds commit one physical state",
 });
 test("legacy scenarios retain parameters and reject unsupported versions and UTC overflow", () => {
   const { schemaVersion, ...legacy } = scenario();
-  assert.equal(normalizeScenario(legacy).schemaVersion, 4);
+  assert.equal(normalizeScenario(legacy).schemaVersion, 5);
   assert.equal(normalizeScenario(legacy).epochMs, legacy.epochMs);
   const a = new SimulationEngine(legacy),
     b = new SimulationEngine({ ...legacy, schemaVersion: 2 });
   a.advanceTo(legacy.durationUs);
   b.advanceTo(legacy.durationUs);
   assert.deepEqual(a.result(), b.result());
-  assert.equal(a.result().modelVersion, "routing-runtime-v4");
+  assert.equal(a.result().modelVersion, "dominant-reference-v5");
   assert.throws(() => normalizeScenario({ ...legacy, schemaVersion: 99 }));
   assert.throws(() =>
     normalizeScenario({ ...legacy, epochMs: 8640000000000000 }),

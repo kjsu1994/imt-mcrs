@@ -23,7 +23,9 @@ test("Worker results match headless replay with normal and throttled rendering",
           raf(() => setTimeout(() => callback(performance.now()), 200));
       });
     await page.goto("/");
-    await expect(page.locator(".run-status")).not.toHaveText("계산 중");
+    await expect(page.locator(".run-status")).not.toHaveText("계산 중", {
+      timeout: 30000,
+    });
     await expect(page.locator(".brand img")).toHaveAttribute(
       "src",
       /logo\.png$/,
@@ -77,7 +79,7 @@ test("Worker results match headless replay with normal and throttled rendering",
     const exported = JSON.parse(
       await readFile((await download.path())!, "utf8"),
     );
-    expect(exported.scenario.schemaVersion).toBe(4);
+    expect(exported.scenario.schemaVersion).toBe(5);
     await expect(
       page.getByLabel("현재 경로 속성", { exact: true }),
     ).toContainText("100.0 %");

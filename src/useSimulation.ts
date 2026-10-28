@@ -16,7 +16,8 @@ export function useSimulation(
       busy: boolean;
       playing: boolean;
     } | null>(null),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [failed, setFailed] = useState(false);
   useEffect(() => {
     const w = new Worker(new URL("./simulation.worker.ts", import.meta.url), {
       type: "module",
@@ -33,15 +34,20 @@ export function useSimulation(
       linkFailures: [],
     };
     setError("");
+    setFailed(false);
     w.onmessage = ({ data }: MessageEvent<Reply>) => {
       if (!active || data.runId !== id.current) return;
-      if (data.type === "error") setError(data.message);
-      else if (data.type === "state") {
+      if (data.type === "error") {
+        setError(data.message);
+        if (data.fatal) setFailed(true);
+      } else if (data.type === "state") {
         if (syncing && !data.reset) return;
         try {
           if (data.reset) {
             if (!data.checkpoint) throw new Error("재동기화 상태가 없습니다.");
             stream.reset(data.checkpoint);
+            setFailed(!!data.progress.failure);
+            if (!data.progress.failure) setError("");
             syncing = false;
           } else {
             stream.receive(data.deltas);
@@ -123,10 +129,17 @@ export function useSimulation(
     frame: state?.owner === scenario ? state.frame : null,
     runId: id.current,
     running:
-      state?.owner === scenario && state.playing && !state.busy && playing,
-    busy: state?.owner !== scenario || state.busy,
+      !failed &&
+      state?.owner === scenario &&
+      state.playing &&
+      !state.busy &&
+      playing,
+    failed,
+    busy: !failed && (state?.owner !== scenario || state.busy),
     ended:
-      state?.owner === scenario && state.frame.timeUs === scenario.durationUs,
+      !failed &&
+      state?.owner === scenario &&
+      state.frame.timeUs === scenario.durationUs,
     error,
     clearError: () => setError(""),
     seek: (atUs: number) => {
