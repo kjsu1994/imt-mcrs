@@ -1,3 +1,4 @@
+import type { RuntimeProfile } from "./performance";
 import { makeCsibDelta } from "./csibDelta";
 import type { CsibDelta } from "./csibDelta";
 
@@ -79,6 +80,8 @@ export type ControlView = {
   };
 };
 export interface ControlEnvironment {
+  profile?: RuntimeProfile;
+  physicalState?(a: number, b: number): { available: boolean; token: number };
   nowUs(): number;
   schedule(atUs: number, priority: number, run: () => void): void;
   graph(domainId: number): RoutingGraph;
@@ -104,7 +107,10 @@ type Pending = {
 };
 // shortcut: atomic control messages omit serialization and queue contention; add those only for packet-level experiments.
 export class ControlTransport {
-  readonly events: ControlEvent[] = [];
+  private records: ControlEvent[] = [];
+  get events(): ControlEvent[] {
+    return structuredClone(this.records);
+  }
   private acknowledgedAds = new Map<string, DomainAdvertisement>();
   private payloadStats = { deltas: 0, checkpoints: 0, resyncRequests: 0 };
   private focusedPending = new Set<string>();
@@ -197,14 +203,15 @@ export class ControlTransport {
       recipient: f.recipient,
       revision: f.revision,
       attempt: f.attempt,
-      path: [...f.path],
+      path: f.path,
       hop: f.hop,
       ...(reason ? { reason } : {}),
     };
-    this.events.push(event);
-    if (this.limits && this.events.length > this.limits.traceLimit) {
+    this.env.profile?.count(`control.records.${type}`);
+    this.records.push(event);
+    if (this.limits && this.records.length > this.limits.traceLimit) {
       const removed = Math.max(1, Math.floor(this.limits.traceLimit / 10));
-      this.events.splice(0, removed);
+      this.records.splice(0, removed);
       this.traceOmitted += removed;
     }
     if (
@@ -219,21 +226,37 @@ export class ControlTransport {
     this.stats.eventCount++;
   }
   private attempt(p: Pending) {
+    this.env.profile?.enter(
+      p.attempt ? "control.retry" : "control.publishUpdate",
+    );
+    try {
+      this.attemptImpl(p);
+    } finally {
+      this.env.profile?.leave();
+    }
+  }
+  private attemptImpl(p: Pending) {
     if (p.attempt) this.stats.retries++;
     p.attempt++;
     p.expiresUs = this.env.nowUs() + this.timeoutUs;
     const baseline =
       this.acknowledgedAds.get(this.key(p.ad.domainId, p.recipient)) ??
       this.env.initialAdvertisement?.(p.ad.domainId);
-    const delta =
-      this.limits &&
-      this.env.receiveDelta &&
-      baseline?.links &&
-      p.ad.links &&
-      baseline.revision < p.ad.revision &&
-      !p.forceCheckpoint
-        ? makeCsibDelta(baseline, p.ad)
-        : undefined;
+    this.env.profile?.enter("csib.delta");
+    let delta: CsibDelta | undefined;
+    try {
+      delta =
+        this.limits &&
+        this.env.receiveDelta &&
+        baseline?.links &&
+        p.ad.links &&
+        baseline.revision < p.ad.revision &&
+        !p.forceCheckpoint
+          ? makeCsibDelta(baseline, p.ad)
+          : undefined;
+    } finally {
+      this.env.profile?.leave();
+    }
     if (this.limits) {
       if (delta) this.payloadStats.deltas++;
       else this.payloadStats.checkpoints++;
@@ -309,6 +332,30 @@ export class ControlTransport {
     expiresUs: number,
     delivered: () => void,
   ): ControlFlight {
+    this.env.profile?.enter("control.generate");
+    try {
+      return this.sendImpl(
+        kind,
+        origin,
+        recipient,
+        revision,
+        attempt,
+        expiresUs,
+        delivered,
+      );
+    } finally {
+      this.env.profile?.leave();
+    }
+  }
+  private sendImpl(
+    kind: ControlFlight["kind"],
+    origin: number,
+    recipient: number,
+    revision: number,
+    attempt: number,
+    expiresUs: number,
+    delivered: () => void,
+  ): ControlFlight {
     const f: ControlFlight = {
       messageId: ++this.sequence,
       kind,
@@ -357,6 +404,7 @@ export class ControlTransport {
         .join("|");
     let tree = this.trees.get(origin);
     if (!tree || tree.signature !== signature) {
+      this.env.profile?.count("control.path.cacheMisses");
       const adjacency: number[][] = Array.from(
         { length: graph.nodeCount },
         () => [],
@@ -377,7 +425,7 @@ export class ControlTransport {
           }
       tree = { signature, parents };
       this.trees.set(origin, tree);
-    }
+    } else this.env.profile?.count("control.path.cacheHits");
     if (tree.parents[target] === -1) return [];
     const path = [target];
     while (path.at(-1)! !== this.ds[origin])
@@ -401,7 +449,14 @@ export class ControlTransport {
       this.flights.delete(f.messageId);
       this.focusedFlights.delete(f.messageId);
       this.emit("delivered", f);
-      delivered();
+      this.env.profile?.enter(
+        f.kind === "ack" ? "control.ack" : "control.receiveUpdate",
+      );
+      try {
+        delivered();
+      } finally {
+        this.env.profile?.leave();
+      }
       return;
     }
     const a = f.path[f.hop],
@@ -419,7 +474,7 @@ export class ControlTransport {
     this.env.schedule(f.arrivesUs, 2.3, () => {
       if (!this.flights.has(f.messageId) || this.env.nowUs() > f.expiresUs)
         return;
-      const current = this.env.physical(a, b);
+      const current = this.env.physicalState?.(a, b) ?? this.env.physical(a, b);
       if (!current.available || current.token !== observed.token) {
         this.drop(f, "link-interrupted");
         return;
@@ -466,7 +521,7 @@ export class ControlTransport {
   exportState() {
     return {
       ...this.view(),
-      events: structuredClone(this.events),
+      events: structuredClone(this.records),
       ...(this.limits
         ? {
             traceOmitted: this.traceOmitted,

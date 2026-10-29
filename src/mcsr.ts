@@ -1,3 +1,4 @@
+import type { RuntimeProfile } from "./performance";
 import { applyCsibDelta } from "./csibDelta";
 import type { CsibDelta } from "./csibDelta";
 import { route } from "./model";
@@ -166,6 +167,10 @@ export class McsrController {
   private availabilityKeys = new WeakMap<RoutingGraph, string>();
   private graphCache = new Map<number, RoutingGraph>();
   private linkIndices = new Map<string, number>();
+  private advertisementLinks = new WeakMap<
+    DomainAdvertisement,
+    Map<string, NetworkLink>
+  >();
   private knownRevisions = new Map<number, number>();
   private inputCache?: string;
   private viewRows = new Map<number, McsrView["domains"][number]>();
@@ -179,6 +184,7 @@ export class McsrController {
       "reference",
     ),
     private target = source,
+    private profile?: RuntimeProfile,
   ) {
     if (
       !Number.isInteger(config.planes) ||
@@ -242,6 +248,19 @@ export class McsrController {
     );
   }
   private advertise(
+    graph: RoutingGraph,
+    domainId: number,
+    revision: number,
+    atUs: number,
+  ) {
+    this.profile?.enter("routing.localSegments");
+    try {
+      return this.advertiseImpl(graph, domainId, revision, atUs);
+    } finally {
+      this.profile?.leave();
+    }
+  }
+  private advertiseImpl(
     graph: RoutingGraph,
     domainId: number,
     revision: number,
@@ -354,7 +373,15 @@ export class McsrController {
       ),
     });
   }
-  update(graph: RoutingGraph, atUs: number): DomainAdvertisement[] {
+  update(graph: RoutingGraph, atUs: number) {
+    this.profile?.enter("csib.update");
+    try {
+      return this.updateImpl(graph, atUs);
+    } finally {
+      this.profile?.leave();
+    }
+  }
+  private updateImpl(graph: RoutingGraph, atUs: number): DomainAdvertisement[] {
     const updates: DomainAdvertisement[] = [];
     for (const d of this.partition.domains) {
       const key = fingerprint(this.ownerLinks(graph, d.id));
@@ -396,7 +423,23 @@ export class McsrController {
           ? b
           : Math.min(a, b);
   }
+  private advertisementLink(ad: DomainAdvertisement, id: string) {
+    let links = this.advertisementLinks.get(ad);
+    if (!links) {
+      links = new Map(ad.links!.map((l) => [l.id, l]));
+      this.advertisementLinks.set(ad, links);
+    }
+    return links.get(id);
+  }
   private setAdvertisement(recipient: number, ad: DomainAdvertisement) {
+    this.profile?.enter("csib.apply");
+    try {
+      return this.setAdvertisementImpl(recipient, ad);
+    } finally {
+      this.profile?.leave();
+    }
+  }
+  private setAdvertisementImpl(recipient: number, ad: DomainAdvertisement) {
     const previous = this.csibs[recipient][ad.domainId],
       cached = this.graphCache.get(recipient);
     this.csibs[recipient][ad.domainId] = ad;
@@ -416,9 +459,7 @@ export class McsrController {
             ? ad.domainId
             : this.crossingOwner(l, ads, recipient);
         const next =
-          owner === ad.domainId
-            ? l
-            : ads[owner].links!.find((p) => p.id === l.id)!;
+          owner === ad.domainId ? l : this.advertisementLink(ads[owner], l.id)!;
         if (!next) throw new Error("CSIB 링크 관측이 누락되었습니다.");
         availabilityChanged ||=
           links[index].knownAvailable !== next.knownAvailable;

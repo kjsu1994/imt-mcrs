@@ -1,3 +1,5 @@
+import { McsrController } from "../src/mcsr.ts";
+import { searchDefaults } from "../src/boundedSearch.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -358,5 +360,110 @@ test("16-node boundary succeeds and incomplete strategy reports are rejected", (
   assert.throws(
     () => new SimulationEngine(scenario, strategy),
     /완료되지 않은/,
+  );
+});
+
+test("MCSR reference matches an independent frontier on 120 zero/equal/HR-boundary and disconnected graphs", () => {
+  let seed = 83412;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  let expectedPaths = 0,
+    recoveredPaths = 0,
+    selections = 0,
+    matches = 0;
+  for (let sample = 0; sample < 120; sample++) {
+    const graph: RoutingGraph = { nodeCount: 6, links: [] };
+    for (let a = 0; a < 6; a++)
+      for (let b = a + 1; b < 6; b++)
+        if (random() < 0.5)
+          graph.links.push({
+            ...link(
+              a,
+              b,
+              Math.floor(random() * 4),
+              Math.floor(random() * 5) / 4,
+              [0, 1, 14.999, 15, 16][Math.floor(random() * 5)],
+            ),
+            knownAvailable: random() > 0.15,
+          });
+    const exact = oracle(graph, 0, 5);
+    const make = (mode: "reference" | "bounded") =>
+      new McsrController(
+        { planes: 2, perPlane: 3 },
+        { planesPerDomain: 1, satellitesPerDomain: 3 },
+        graph,
+        0,
+        searchDefaults(6, mode),
+        5,
+      );
+    const reference = make("reference").calculate(0, 5);
+    assert.deepEqual(reference, exact);
+    const bounded = make("bounded").calculate(0, 5);
+    assert.deepEqual(make("bounded").calculate(0, 5), bounded);
+    for (const p of bounded) {
+      assert.equal(new Set(p.nodes).size, p.nodes.length);
+      assert.equal(p.nodes[0], 0);
+      assert.equal(p.nodes.at(-1), 5);
+      // Recompute from raw input without calling the routing metric helpers.
+      let D = 0,
+        A = 1,
+        J = 0;
+      for (let i = 1; i < p.nodes.length; i++) {
+        const l = graph.links.find(
+          (l) =>
+            l.knownAvailable &&
+            ((l.sourceId === p.nodes[i - 1] && l.targetId === p.nodes[i]) ||
+              (l.targetId === p.nodes[i - 1] && l.sourceId === p.nodes[i])),
+        )!;
+        assert.ok(l);
+        D += l.metrics.propagationDelayMs;
+        A = Math.min(A, l.metrics.availableBufferRatio);
+        J = Math.max(J, l.metrics.jitterMs);
+      }
+      assert.deepEqual(
+        [p.propagationDelayMs, p.availableBufferRatio, p.jitterMs],
+        [D, A, J],
+      );
+    }
+    expectedPaths += exact.length;
+    recoveredPaths += exact.filter((p) =>
+      bounded.some((q) => p.nodes.join(":") === q.nodes.join(":")),
+    ).length;
+    for (const service of ["LS", "TS", "HR"] as const) {
+      const eligible = exact.filter((p) => service !== "HR" || p.jitterMs < 15);
+      eligible.sort(
+        (a, b) =>
+          (service === "LS"
+            ? a.propagationDelayMs - b.propagationDelayMs ||
+              b.availableBufferRatio - a.availableBufferRatio
+            : b.availableBufferRatio - a.availableBufferRatio ||
+              a.propagationDelayMs - b.propagationDelayMs) ||
+          a.jitterMs - b.jitterMs ||
+          (a.nodes.join(":") < b.nodes.join(":") ? -1 : 1),
+      );
+      assert.deepEqual(
+        analyseCandidates(reference, service).selected,
+        eligible[0] ?? null,
+      );
+      selections++;
+      if (
+        JSON.stringify(analyseCandidates(bounded, service).selected) ===
+        JSON.stringify(eligible[0] ?? null)
+      )
+        matches++;
+    }
+  }
+  console.info(
+    JSON.stringify({
+      sampleGraphs: 120,
+      paretoRecall: recoveredPaths / expectedPaths,
+      selectionMatchRate: matches / selections,
+      expectedPaths,
+      recoveredPaths,
+      matches,
+      selections,
+    }),
   );
 });

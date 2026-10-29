@@ -6,7 +6,13 @@ import {
 } from "../src/controlTransport.ts";
 import type { DomainAdvertisement } from "../src/mcsr.ts";
 import type { RoutingGraph } from "../src/routing.ts";
-function harness(timeout = 100, processing = 0, ds = [0, 2]) {
+function harness(
+  timeout = 100,
+  processing = 0,
+  ds = [0, 2],
+  stateOnly = false,
+) {
+  let distanceReads = 0;
   let now = 0,
     sequence = 0;
   const queue: { at: number; p: number; s: number; run: () => void }[] = [],
@@ -46,7 +52,16 @@ function harness(timeout = 100, processing = 0, ds = [0, 2]) {
     schedule: (at: number, p: number, run: () => void) =>
       queue.push({ at, p, s: sequence++, run }),
     graph: () => known,
+    ...(stateOnly
+      ? {
+          physicalState: (a: number, b: number) => {
+            const l = links.get(`${Math.min(a, b)}:${Math.max(a, b)}`)!;
+            return { available: l.up, token: l.token };
+          },
+        }
+      : {}),
     physical: (a: number, b: number) => {
+      distanceReads++;
       const l = links.get(`${Math.min(a, b)}:${Math.max(a, b)}`)!;
       return { available: l.up, token: l.token, delayUs: 10 };
     },
@@ -82,6 +97,7 @@ function harness(timeout = 100, processing = 0, ds = [0, 2]) {
   });
   return {
     c,
+    distanceReads: () => distanceReads,
     run,
     set,
     ad,
@@ -218,4 +234,27 @@ test("a newer version arriving first prevents an older in-flight update from ove
   assert.deepEqual(h.applied, [{ at: 15, revision: 2 }]);
   assert.equal(h.versions[1], 2);
   assert.ok(h.c.events.some((e) => e.type === "duplicate" && e.revision === 1));
+});
+
+test("arrival state-only checks retain every hop/ACK event and isolate external traces", () => {
+  const original = harness(),
+    optimized = harness(100, 0, [0, 2], true);
+  for (const h of [original, optimized]) {
+    h.c.publish(h.ad());
+    h.run(3);
+    const exported = h.c.events;
+    exported.at(-1)!.path[0] = 99;
+    const view = h.c.view();
+    view.flights[0].path[0] = 99;
+    h.run(200);
+  }
+  assert.deepEqual(optimized.c.exportState(), original.c.exportState());
+  assert.equal(optimized.distanceReads() * 2, original.distanceReads());
+  const interrupted = harness(100, 0, [0, 2], true);
+  interrupted.c.publish(interrupted.ad());
+  interrupted.run(3);
+  interrupted.set("0:1", false);
+  interrupted.set("0:1", true);
+  interrupted.run(10);
+  assert.equal(interrupted.c.events.at(-1)!.reason, "link-interrupted");
 });

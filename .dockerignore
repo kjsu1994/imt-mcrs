@@ -11,3 +11,5 @@ tests
 *.pdf
 *.tsbuildinfo
 *.log
+
+artifacts

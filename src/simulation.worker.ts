@@ -1,9 +1,16 @@
+import type { ProfileMode } from "./performance";
+import type { WorkerPerformance } from "./browserPerformance";
 import { SimulationEngine } from "./engine";
 import type { Command, Reply } from "./protocol";
 const port = self as unknown as {
   onmessage: ((e: MessageEvent<Command>) => void) | null;
   postMessage: (reply: Reply) => void;
 };
+let timer: ReturnType<typeof setTimeout>;
+function schedulePump(delay: number) {
+  clearTimeout(timer);
+  timer = setTimeout(pump, delay);
+}
 let engine: SimulationEngine | null = null,
   runId = 0,
   playing = false,
@@ -19,6 +26,37 @@ let engine: SimulationEngine | null = null,
   pendingReset = false,
   pendingVerify = false,
   busyReported = false;
+let profile: ProfileMode = "off";
+const emptyPerformance = () => ({
+  constructorMs: 0,
+  activeMs: 0,
+  maxSliceMs: 0,
+  pumps: 0,
+  commands: 0,
+  maxCommandLatencyMs: 0,
+});
+let workerPerformance = emptyPerformance();
+function resetPerformance(issuedAtMs?: number) {
+  workerPerformance = emptyPerformance();
+  workerPerformance.commands = 1;
+  if (issuedAtMs !== undefined)
+    workerPerformance.maxCommandLatencyMs = Math.max(
+      0,
+      performance.timeOrigin + performance.now() - issuedAtMs,
+    );
+}
+function performanceReport(): WorkerPerformance | undefined {
+  if (profile === "off") return undefined;
+  const engineReport = engine?.performanceReport() ?? null;
+  return {
+    ...workerPerformance,
+    engine: engineReport,
+    eventsPerActiveSecond: workerPerformance.activeMs
+      ? (1000 * (engineReport?.counters["events.executed"] ?? 0)) /
+        workerPerformance.activeMs
+      : null,
+  };
+}
 const exportsPending: ("scenario" | "result")[] = [];
 function anchor() {
   anchorWall = performance.now();
@@ -57,6 +95,7 @@ function send(reset = false, verify = false) {
   const deltas = engine.drainDeltas();
   port.postMessage({
     type: "state",
+    ...(profile !== "off" ? { performance: performanceReport() } : {}),
     runId,
     progress,
     busy: target !== null,
@@ -90,6 +129,14 @@ function fail(error: unknown, stop = true) {
 }
 port.onmessage = ({ data: c }) => {
   try {
+    if (profile !== "off") {
+      workerPerformance.commands++;
+      if (c.issuedAtMs !== undefined)
+        workerPerformance.maxCommandLatencyMs = Math.max(
+          workerPerformance.maxCommandLatencyMs,
+          performance.timeOrigin + performance.now() - c.issuedAtMs,
+        );
+    }
     if (c.type === "load") {
       runId = c.runId;
       engine = null;
@@ -97,7 +144,13 @@ port.onmessage = ({ data: c }) => {
       pendingReset = true;
       pendingVerify = false;
       busyReported = false;
-      const next = new SimulationEngine(c.scenario, undefined, true);
+      profile = c.profile ?? "off";
+      resetPerformance(c.issuedAtMs);
+      const createdAt = performance.now();
+      const next = new SimulationEngine(c.scenario, undefined, true, {
+        profile,
+      });
+      workerPerformance.constructorMs = performance.now() - createdAt;
       engine = next;
       playing = c.playing;
       speed = c.speed;
@@ -131,7 +184,10 @@ port.onmessage = ({ data: c }) => {
         exportsPending.length = 0;
         pendingReset = true;
         pendingVerify = false;
-        engine = new SimulationEngine(scenario, undefined, true);
+        resetPerformance(c.issuedAtMs);
+        const replayCreatedAt = performance.now();
+        engine = new SimulationEngine(scenario, undefined, true, { profile });
+        workerPerformance.constructorMs = performance.now() - replayCreatedAt;
         target = c.atUs;
         anchor();
         send(true);
@@ -170,6 +226,8 @@ port.onmessage = ({ data: c }) => {
     }
   } catch (error) {
     fail(error, c.type === "load" || c.type === "seek" || !!engine?.failure);
+  } finally {
+    schedulePump(0);
   }
 };
 function exportReady() {
@@ -184,6 +242,9 @@ function exportReady() {
           ? structuredClone(engine.scenario)
           : {
               scenario: structuredClone(engine.scenario),
+              ...(profile !== "off"
+                ? { performance: performanceReport() }
+                : {}),
               result: engine.result(),
               profiling: structuredClone(engine.profiling),
             },
@@ -204,7 +265,21 @@ function pump() {
             )
           : engine.nowUs);
       if (target !== null || playing || engine.needsWork) {
-        const done = engine.advanceTo(Math.max(engine.nowUs, until), 500);
+        const sliceStarted = performance.now();
+        const deadline = sliceStarted + (target !== null ? 12 : 6);
+        let done: boolean;
+        do {
+          done = engine.advanceTo(Math.max(engine.nowUs, until), 128);
+        } while (!done && performance.now() < deadline);
+        if (profile !== "off") {
+          const elapsed = performance.now() - sliceStarted;
+          workerPerformance.activeMs += elapsed;
+          workerPerformance.maxSliceMs = Math.max(
+            workerPerformance.maxSliceMs,
+            elapsed,
+          );
+          workerPerformance.pumps++;
+        }
         if (done && target !== null) {
           target = null;
           anchor();
@@ -222,6 +297,12 @@ function pump() {
   } catch (error) {
     fail(error);
   }
-  setTimeout(pump, 8);
+  schedulePump(
+    engine &&
+      !engine.failure &&
+      (target !== null || playing || engine.needsWork)
+      ? 0
+      : 100,
+  );
 }
 pump();

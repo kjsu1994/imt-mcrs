@@ -1,3 +1,5 @@
+import type { ProfileMode } from "./performance";
+import type { WorkerPerformance } from "./browserPerformance";
 import type {
   Scenario,
   FailureEvent,
@@ -5,9 +7,10 @@ import type {
   TopologyDelta,
   SimulationEngine,
 } from "./engine";
-export type Command =
+export type Command = (
   | {
       type: "load";
+      profile?: ProfileMode;
       runId: number;
       scenario: Scenario;
       playing: boolean;
@@ -19,11 +22,13 @@ export type Command =
   | { type: "step"; runId: number }
   | { type: "failure"; runId: number; event: FailureEvent; immediate?: boolean }
   | { type: "finish"; runId: number }
-  | { type: "export"; runId: number; what: "scenario" | "result" };
+  | { type: "export"; runId: number; what: "scenario" | "result" }
+) & { issuedAtMs?: number };
 export type Reply =
   | { type: "busy"; runId: number }
   | {
       type: "state";
+      performance?: WorkerPerformance;
       runId: number;
       progress: Omit<
         ReturnType<SimulationEngine["progress"]>,
@@ -49,6 +54,7 @@ export type Reply =
         | Scenario
         | {
             scenario: Scenario;
+            performance?: WorkerPerformance;
             result: ReturnType<SimulationEngine["result"]>;
             profiling: { atUs: number; wallMs: number }[];
           };

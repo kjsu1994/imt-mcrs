@@ -14,7 +14,7 @@ const under = (v: Vec3) => ({
   longitude: (Math.atan2(v.y, v.x) * 180) / Math.PI,
 });
 
-test("right-click places separate UT and GS, drag still zooms, and coordinates save and delete", async ({
+test("right-click places separate GS and UT, drag still zooms, and coordinates save and delete", async ({
   page,
 }) => {
   const errors: string[] = [],
@@ -48,13 +48,13 @@ test("right-click places separate UT and GS, drag still zooms, and coordinates s
   expect(menu.x).toBeGreaterThanOrEqual(box.x);
   expect(menu.x + menu.width).toBeLessThanOrEqual(box.x + box.width);
   await page
-    .getByRole("menuitem", { name: "여기에 사용자 단말(UT) 지정" })
+    .getByRole("menuitem", { name: "여기에 지상국(GS) 지정" })
     .click();
   await expect(page.getByLabel("통신 끝점", { exact: true })).toHaveValue(
     "ground",
   );
-  await expect(page.getByLabel("UT 위도", { exact: true })).not.toHaveValue("");
-  await expect(page.getByLabel("GS 위도", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("GS 위도", { exact: true })).not.toHaveValue("");
+  await expect(page.getByLabel("UT 위도", { exact: true })).toHaveValue("");
   await expect(
     page.getByLabel("지상 서비스 상태", { exact: true }),
   ).toContainText("대기");
@@ -62,18 +62,18 @@ test("right-click places separate UT and GS, drag still zooms, and coordinates s
     button: "right",
     position: { x: center.x + 20, y: center.y + 10 },
   });
-  await page.getByRole("menuitem", { name: "여기에 지상국(GS) 지정" }).click();
-  await expect(page.getByLabel("GS 위도", { exact: true })).not.toHaveValue("");
-  await page.getByLabel("UT 위도", { exact: true }).fill("19.4326");
-  await page.getByLabel("UT 경도", { exact: true }).fill("-99.1332");
-  await page.getByLabel("GS 위도", { exact: true }).fill("34.0522");
-  await page.getByLabel("GS 경도", { exact: true }).fill("-118.2437");
+  await page.getByRole("menuitem", { name: "여기에 사용자 단말(UT) 지정" }).click();
+  await expect(page.getByLabel("UT 위도", { exact: true })).not.toHaveValue("");
+  await page.getByLabel("GS 위도", { exact: true }).fill("19.4326");
+  await page.getByLabel("GS 경도", { exact: true }).fill("-99.1332");
+  await page.getByLabel("UT 위도", { exact: true }).fill("34.0522");
+  await page.getByLabel("UT 경도", { exact: true }).fill("-118.2437");
   await page
     .getByRole("button", { name: "지상 설정 적용", exact: true })
     .click();
   await expect(
     page.getByLabel("지상 서비스 상태", { exact: true }),
-  ).toContainText("연결");
+  ).toContainText("GS → 위성망 → UT 연결");
   await expect(page.getByLabel("출발 노드", { exact: true })).toHaveCount(0);
   const download = page.waitForEvent("download");
   await page
@@ -91,9 +91,9 @@ test("right-click places separate UT and GS, drag still zooms, and coordinates s
   await page.mouse.move(box.x + center.x, box.y + center.y + 60, { steps: 8 });
   await page.mouse.up({ button: "right" });
   await expect(page.getByRole("menu")).toHaveCount(0);
-  await page.getByRole("button", { name: "UT 삭제", exact: true }).click();
-  await expect(page.getByLabel("UT 위도", { exact: true })).toHaveValue("");
-  await expect(page.getByLabel("GS 위도", { exact: true })).toHaveValue(
+  await page.getByRole("button", { name: "GS 삭제", exact: true }).click();
+  await expect(page.getByLabel("GS 위도", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("UT 위도", { exact: true })).toHaveValue(
     "34.0522",
   );
   await expect(
@@ -123,10 +123,10 @@ test("BFS and MCSR ground handovers, exports and seeking match headless replay",
       buffer: Buffer.from(JSON.stringify(s)),
     });
     await expect(
-      page.getByLabel("UT 접속 상태", { exact: true }),
+      page.getByLabel("GS 접속 상태", { exact: true }),
     ).toContainText("위성 0 ·", { timeout: 30000 });
     await expect(
-      page.getByLabel("GS 접속 상태", { exact: true }),
+      page.getByLabel("UT 접속 상태", { exact: true }),
     ).toContainText("위성 61 ·");
     await page
       .getByRole("button", { name: "끝까지 실행", exact: true })
@@ -138,7 +138,7 @@ test("BFS and MCSR ground handovers, exports and seeking match headless replay",
       page.getByLabel("지상 서비스 상태", { exact: true }),
     ).toContainText("연결");
     await expect(
-      page.getByLabel("UT 접속 상태", { exact: true }),
+      page.getByLabel("GS 접속 상태", { exact: true }),
     ).toContainText("위성 41 ·");
     const pending = page.waitForEvent("download");
     await page.getByRole("button", { name: "결과 저장", exact: true }).click();
@@ -156,7 +156,7 @@ test("BFS and MCSR ground handovers, exports and seeking match headless replay",
     ).toContainText("수립 중", { timeout: 30000 });
     await page.getByLabel("시뮬레이션 시간", { exact: true }).fill("248");
     await expect(
-      page.getByLabel("UT 접속 상태", { exact: true }),
+      page.getByLabel("GS 접속 상태", { exact: true }),
     ).toContainText("위성 0 ·", { timeout: 30000 });
     if (algorithm === "mcsr")
       await page.screenshot({ path: "test-results/ground-mcsr-72.png" });
@@ -185,10 +185,10 @@ test("1584-satellite ground endpoints work with both BFS and MCSR", async ({
       page.getByLabel("지상 서비스 상태", { exact: true }),
     ).toContainText("연결", { timeout: 60000 });
     await expect(
-      page.getByLabel("UT 접속 상태", { exact: true }),
+      page.getByLabel("GS 접속 상태", { exact: true }),
     ).toContainText("위성 0 ·");
     await expect(
-      page.getByLabel("GS 접속 상태", { exact: true }),
+      page.getByLabel("UT 접속 상태", { exact: true }),
     ).toContainText("위성 1573 ·");
     await page
       .getByRole("button", { name: "끝까지 실행", exact: true })
@@ -238,11 +238,11 @@ test("ground configuration and right-click menus fit small viewports", async ({
       box.y + box.height + 1,
     );
     await page
-      .getByRole("menuitem", { name: "여기에 사용자 단말(UT) 지정" })
+      .getByRole("menuitem", { name: "여기에 지상국(GS) 지정" })
       .click();
     await expect(page.locator(".config-panel")).toHaveCount(0);
     await expect(page.locator(".info-panel")).toBeVisible();
-    await expect(page.getByLabel("UT 위도", { exact: true })).not.toHaveValue(
+    await expect(page.getByLabel("GS 위도", { exact: true })).not.toHaveValue(
       "",
     );
     expect(

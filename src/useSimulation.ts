@@ -43,6 +43,8 @@ export function useSimulation(
         setError(data.message);
         if (data.fatal) setFailed(true);
       } else if (data.type === "state") {
+        if (data.performance)
+          (window.__mcsrPerformance ??= {}).worker = data.performance;
         if (syncing && !data.reset) return;
         try {
           if (data.reset) {
@@ -114,6 +116,13 @@ export function useSimulation(
     };
     w.postMessage({
       type: "load",
+      profile:
+        new URLSearchParams(window.location.search).get("profile") === "detail"
+          ? "detail"
+          : new URLSearchParams(window.location.search).has("profile")
+            ? "light"
+            : "off",
+      issuedAtMs: performance.timeOrigin + performance.now(),
       runId,
       scenario,
       playing,
@@ -128,13 +137,17 @@ export function useSimulation(
   useEffect(() => {
     worker.current?.postMessage({
       type: "play",
+      issuedAtMs: performance.timeOrigin + performance.now(),
       runId: id.current,
       playing,
       speed,
     } satisfies Command);
   }, [playing, speed, scenario]);
   function send(command: Command) {
-    worker.current?.postMessage(command);
+    worker.current?.postMessage({
+      ...command,
+      issuedAtMs: performance.timeOrigin + performance.now(),
+    });
   }
   return {
     topology: topology.current,

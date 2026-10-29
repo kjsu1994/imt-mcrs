@@ -1,3 +1,4 @@
+import { groundLabel } from "./groundPresentation";
 import { useEffect, useState } from "react";
 import { defaultGround } from "./ground";
 import type { GroundSettings } from "./ground";
@@ -32,13 +33,13 @@ export default function GroundPanel({
           }
         >
           <option value="satellite">위성 ↔ 위성</option>
-          <option value="ground">사용자 단말(UT) ↔ 지상국(GS)</option>
+          <option value="ground">지상국(GS) → 사용자 단말(UT)</option>
         </select>
       </label>
       {settings && (
         <>
           <p className="model-caption">
-            지구 표면 우클릭으로 UT·GS 지정 · 위치·설정 적용 시 새 실험
+            지구 표면 우클릭으로 GS·UT 지정 · 위치·설정 적용 시 새 실험
           </p>
           <form
             onSubmit={(e) => {
@@ -49,7 +50,7 @@ export default function GroundPanel({
             {(["ut", "gs"] as const).map((role) => (
               <fieldset className="ground-endpoint" key={role}>
                 <legend>
-                  {role === "ut" ? "사용자 단말 UT" : "지상국 GS"}
+                  {role === "ut" ? "송신 지상국 GS" : "목적지 사용자 단말 UT"}
                 </legend>
                 <div className="field-grid">
                   {(["latitude", "longitude"] as const).map((key) => (
@@ -60,7 +61,7 @@ export default function GroundPanel({
                         step="any"
                         min={key === "latitude" ? -90 : -180}
                         max={key === "latitude" ? 90 : 180}
-                        aria-label={`${role.toUpperCase()} ${key === "latitude" ? "위도" : "경도"}`}
+                        aria-label={`${groundLabel(role)} ${key === "latitude" ? "위도" : "경도"}`}
                         value={
                           Number.isNaN(draft[role]?.[key])
                             ? ""
@@ -85,7 +86,7 @@ export default function GroundPanel({
                 </div>
                 <p
                   className="model-caption"
-                  aria-label={`${role.toUpperCase()} 접속 상태`}
+                  aria-label={`${groundLabel(role)} 접속 상태`}
                 >
                   {!settings[role]
                     ? "위치 미지정"
@@ -98,7 +99,7 @@ export default function GroundPanel({
                   disabled={!settings[role]}
                   onClick={() => onChange({ ...settings, [role]: null })}
                 >
-                  {role.toUpperCase()} 삭제
+                  {groundLabel(role)} 삭제
                 </button>
               </fieldset>
             ))}
@@ -156,7 +157,7 @@ export default function GroundPanel({
           </form>
           <p className="ground-status" aria-label="지상 서비스 상태">
             {view?.available
-              ? "UT → 위성망 → GS 연결"
+              ? "GS → 위성망 → UT 연결"
               : !view ||
                   view.ut.satelliteId === null ||
                   view.gs.satelliteId === null
@@ -206,7 +207,7 @@ export default function GroundPanel({
             <ol className="event-list">
               {frame?.groundAccessEvents?.map((e, i) => (
                 <li key={i}>
-                  {(e.atUs / 1000000).toFixed(3)}초 · {e.role.toUpperCase()} ·{" "}
+                  {(e.atUs / 1000000).toFixed(3)}초 · {groundLabel(e.role)} ·{" "}
                   {e.from ?? "미접속"} → {e.to ?? "미접속"}
                 </li>
               ))}

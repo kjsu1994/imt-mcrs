@@ -22,7 +22,7 @@ test("Worker results match headless replay with normal and throttled rendering",
         window.requestAnimationFrame = (callback) =>
           raf(() => setTimeout(() => callback(performance.now()), 200));
       });
-    await page.goto("/");
+    await page.goto("/?profile=light");
     await expect(page.locator(".run-status")).not.toHaveText("계산 중", {
       timeout: 30000,
     });
@@ -80,6 +80,12 @@ test("Worker results match headless replay with normal and throttled rendering",
       await readFile((await download.path())!, "utf8"),
     );
     expect(exported.scenario.schemaVersion).toBe(9);
+    expect(exported.scenario.profile).toBeUndefined();
+    expect(exported.result.performance).toBeUndefined();
+    expect(
+      exported.performance.engine.counters["events.executed"],
+    ).toBeGreaterThan(0);
+    expect(exported.performance.pumps).toBeGreaterThan(0);
     await expect(
       page.getByLabel("현재 경로 속성", { exact: true }),
     ).toContainText("100.0 %");

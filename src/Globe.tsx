@@ -1,3 +1,5 @@
+import { groundLabel } from "./groundPresentation";
+import { FrameSamples } from "./browserPerformance";
 import type { GroundSettings, GroundPoint, GroundRole } from "./ground";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -33,7 +35,7 @@ import {
   period,
 } from "./model";
 import type { Config, Vec3 } from "./model";
-import type { SimulationFrame, RenderCheckpoint } from "./engine";
+import type { SimulationFrame, LinkState } from "./engine";
 import type { TopologyStream } from "./topologyStream";
 import { DisplayClock } from "./displayClock";
 export type Telemetry = {
@@ -195,7 +197,7 @@ export default function Globe(props: Props) {
         groundLabels.add({
           position: Cartesian3.ZERO,
           show: false,
-          text: role.toUpperCase(),
+          text: groundLabel(role),
           font: "bold 13px sans-serif",
           fillColor: Color.fromCssColorString(
             role === "ut" ? "#80efbb" : "#ffbb78",
@@ -234,6 +236,37 @@ export default function Globe(props: Props) {
       const orbits = viewer.scene.primitives.add(
         new PolylineCollection(),
       ) as PolylineCollection;
+      const pos: Vec3[] = [],
+        scenePositions: Cartesian3[] = [];
+      const packetPosition = new Cartesian3(),
+        controlPosition = new Cartesian3();
+      const currentTime = new JulianDate();
+      const flowPositions: Cartesian3[] = [];
+      const updatePath = (
+        line: { positions: Cartesian3[] },
+        nodes: number[],
+      ) => {
+        const values = line.positions;
+        values.length = nodes.length;
+        for (let i = 0; i < nodes.length; i++)
+          values[i] = scenePositions[nodes[i]];
+        line.positions = values;
+      };
+      let lastMembership: number[] | undefined,
+        membershipKey = "";
+      const frameSamples = new URLSearchParams(window.location.search).has(
+        "profile",
+      )
+        ? new FrameSamples()
+        : undefined;
+      let updateStarted = 0,
+        updateMs = 0,
+        renderStarted = 0,
+        lastPerformanceReport = 0;
+      let positionSeconds = NaN,
+        previousIconView = false,
+        previousLinks = false;
+      let lastTelemetry: Telemetry | undefined;
       let config: Config | null = null,
         wireIds: [number, number][] = [],
         lastSelected: number | null | undefined,
@@ -245,7 +278,7 @@ export default function Globe(props: Props) {
         lastReport = 0,
         lastStyle = "",
         lastSelectedLink = "",
-        lastFrame: RenderCheckpoint | null = null,
+        lastLinks: LinkState[] | undefined,
         lastGeneration = -1,
         lastTrack = false,
         lastRunId = -1,
@@ -336,6 +369,7 @@ export default function Globe(props: Props) {
       );
       const update = () => {
         if (!viewer || viewer.isDestroyed()) return;
+        if (frameSamples) updateStarted = performance.now();
         const p = current.current,
           now = performance.now();
         if (
@@ -363,7 +397,7 @@ export default function Globe(props: Props) {
         viewer.clock.currentTime = JulianDate.addSeconds(
           start,
           seconds,
-          new JulianDate(),
+          currentTime,
         );
         const display = p.frame ? p.topology.at(displayClock.at(now)) : null;
         const path = display?.path ?? [];
@@ -372,6 +406,7 @@ export default function Globe(props: Props) {
         const target = ground ? ground.gs.satelliteId : p.target;
         if (config !== p.config) {
           config = p.config;
+          positionSeconds = NaN;
           points.removeAll();
           satelliteIcons.removeAll();
           dsLabels.removeAll();
@@ -421,7 +456,7 @@ export default function Globe(props: Props) {
               outlineColor: Color.fromCssColorString("#e8aa32"),
               show: false,
             });
-          lastFrame = null;
+          lastLinks = undefined;
           lastStyle = "";
           routeKey = "";
           linkKey = "";
@@ -429,8 +464,18 @@ export default function Globe(props: Props) {
           lastSelected = undefined;
           orbitBucket = -1;
         }
-        const pos = positions(p.config, seconds, p.startMs);
-        const scenePositions = pos.map(cart);
+        const positionChanged = seconds !== positionSeconds;
+        if (positionChanged) {
+          positions(p.config, seconds, p.startMs, pos);
+          scenePositions.length = pos.length;
+          for (let id = 0; id < pos.length; id++) {
+            const at = (scenePositions[id] ??= new Cartesian3());
+            at.x = pos[id].x;
+            at.y = pos[id].y;
+            at.z = pos[id].z;
+          }
+          positionSeconds = seconds;
+        }
         const groundPositions: Partial<Record<GroundRole, Cartesian3>> = {};
         for (const [i, role] of (["ut", "gs"] as const).entries()) {
           const point = p.groundSettings?.[role],
@@ -492,11 +537,16 @@ export default function Globe(props: Props) {
             Cartesian3.distance(viewer.camera.positionWC, label.position) <
               iconDistance / 2;
         }
-        const styleKey = `${p.selected}:${source}:${target}:${srd?.membership.join(":") ?? ""}`;
+        if (lastMembership !== srd?.membership) {
+          lastMembership = srd?.membership;
+          membershipKey = lastMembership?.join(":") ?? "";
+        }
+        const styleKey = `${p.selected}:${source}:${target}:${membershipKey}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
-          dot.position = scenePositions[id];
-          if (iconView) satelliteIcons.get(id).position = scenePositions[id];
+          if (positionChanged) dot.position = scenePositions[id];
+          if (iconView && (positionChanged || !previousIconView))
+            satelliteIcons.get(id).position = scenePositions[id];
           if (styleKey !== lastStyle) {
             const domain = srd?.domains[srd.membership[id]];
             const isDs = domain?.ds === id;
@@ -529,9 +579,10 @@ export default function Globe(props: Props) {
             );
           }
         }
+        previousIconView = iconView;
         lastStyle = styleKey;
         if (
-          lastFrame !== display ||
+          lastLinks !== display?.links ||
           lastSelectedLink !== p.selectedLink ||
           styleKey !== lastLinkStyle
         ) {
@@ -585,21 +636,26 @@ export default function Globe(props: Props) {
             }
             linkKey = nextLinkKey;
           }
-          lastFrame = display;
+          lastLinks = display?.links;
           lastSelectedLink = p.selectedLink;
         }
         wireGroups.forEach((group) => {
           group.show = p.links;
         });
         // Every visible primitive uses the same interpolated display time.
-        if (p.links) {
+        if (p.links && (positionChanged || !previousLinks)) {
           for (let i = 0; i < wireIds.length; i++) {
             const [a, b] = wireIds[i];
-            wireGroups[Math.floor(i / linesPerGroup)].get(
+            const line = wireGroups[Math.floor(i / linesPerGroup)].get(
               i % linesPerGroup,
-            ).positions = [scenePositions[a], scenePositions[b]];
+            );
+            const endpoints = line.positions;
+            endpoints[0] = scenePositions[a];
+            endpoints[1] = scenePositions[b];
+            line.positions = endpoints;
           }
         }
+        previousLinks = p.links;
         const key = path.join(":");
         if (key !== routeKey) {
           paths.removeAll();
@@ -611,7 +667,7 @@ export default function Globe(props: Props) {
           routeKey = key;
         }
         if (paths.length) {
-          paths.get(0).positions = path.map((id) => scenePositions[id]);
+          if (positionChanged) updatePath(paths.get(0), path);
           paths.get(0).material.uniforms.color = Color.fromCssColorString(
             display?.pathValid ? "#80efbb" : "#ff7a82",
           ).withAlpha(0.9);
@@ -643,10 +699,12 @@ export default function Globe(props: Props) {
             }
           previewKey = nextPreview;
         }
-        for (let i = 0; i < previewLines.length; i++)
-          previewLines.get(i).positions = srd
-            ? [scenePositions[preview[i]], scenePositions[preview[i + 1]]]
-            : preview.map((id) => scenePositions[id]);
+        if (positionChanged)
+          for (let i = 0; i < previewLines.length; i++)
+            updatePath(
+              previewLines.get(i),
+              srd ? [preview[i], preview[i + 1]] : preview,
+            );
         const flights = p.showControl
           ? (display?.mcsr?.control?.flights ?? [])
           : [];
@@ -685,7 +743,7 @@ export default function Globe(props: Props) {
               scenePositions[a],
               scenePositions[b],
               t,
-              new Cartesian3(),
+              controlPosition,
             );
           } else {
             const node = display?.mcsr?.domains[f.origin]?.ds;
@@ -710,15 +768,14 @@ export default function Globe(props: Props) {
           }
           controlPathKey = controlKey;
         }
-        if (controlLines.length)
-          controlLines.get(0).positions = controlPath.map(
-            (id) => scenePositions[id],
-          );
-        const flowPositions = path.map((id) => scenePositions[id]);
-        if (ground?.available && groundPositions.ut && groundPositions.gs) {
-          flowPositions.unshift(groundPositions.ut);
-          flowPositions.push(groundPositions.gs);
-        }
+        if (controlLines.length && positionChanged)
+          updatePath(controlLines.get(0), controlPath);
+        flowPositions.length = 0;
+        const groundFlow =
+          ground?.available && groundPositions.ut && groundPositions.gs;
+        if (groundFlow) flowPositions.push(groundPositions.ut!);
+        for (const id of path) flowPositions.push(scenePositions[id]);
+        if (groundFlow) flowPositions.push(groundPositions.gs!);
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
           dot.show =
@@ -733,7 +790,7 @@ export default function Globe(props: Props) {
             flowPositions[index],
             flowPositions[index + 1],
             hop - index,
-            new Cartesian3(),
+            packetPosition,
           );
         }
         if (
@@ -803,15 +860,40 @@ export default function Globe(props: Props) {
             p.selected === null
               ? null
               : Cartographic.fromCartesian(cart(pos[p.selected]));
-          current.current.onTelemetry({
+          const telemetry = {
             latitude: location ? CMath.toDegrees(location.latitude) : 0,
             longitude: location ? CMath.toDegrees(location.longitude) : 0,
             altitude: location ? location.height / 1000 : 0,
-          });
+          };
+          if (
+            !lastTelemetry ||
+            telemetry.latitude !== lastTelemetry.latitude ||
+            telemetry.longitude !== lastTelemetry.longitude ||
+            telemetry.altitude !== lastTelemetry.altitude
+          ) {
+            current.current.onTelemetry(telemetry);
+            lastTelemetry = telemetry;
+          }
           lastReport = now;
         }
       };
       viewer.scene.preUpdate.addEventListener(update);
+      if (frameSamples) {
+        viewer.scene.postUpdate.addEventListener(() => {
+          updateMs = performance.now() - updateStarted;
+        });
+        viewer.scene.preRender.addEventListener(() => {
+          renderStarted = performance.now();
+        });
+        viewer.scene.postRender.addEventListener(() => {
+          const now = performance.now();
+          frameSamples.sample(now, updateMs, now - renderStarted);
+          if (now - lastPerformanceReport >= 1000) {
+            (window.__mcsrPerformance ??= {}).renderer = frameSamples.report();
+            lastPerformanceReport = now;
+          }
+        });
+      }
       viewer.scene.renderError.addEventListener((_scene, error) => {
         if (!disposed)
           current.current.onError(`3D 렌더링 오류: ${String(error)}`);
@@ -854,7 +936,7 @@ export default function Globe(props: Props) {
               setMenu(null);
             }}
           >
-            여기에 사용자 단말(UT) 지정
+            여기에 지상국(GS) 지정
           </button>
           <button
             role="menuitem"
@@ -863,7 +945,7 @@ export default function Globe(props: Props) {
               setMenu(null);
             }}
           >
-            여기에 지상국(GS) 지정
+            여기에 사용자 단말(UT) 지정
           </button>
           <button role="menuitem" onClick={() => setMenu(null)}>
             닫기

@@ -45,16 +45,30 @@ export const emptySearch = (): DominantSearchSummary => ({
   removedPaths: 0,
   prunedSamples: [],
 });
-const identity: LinkMetrics = {
-  propagationDelayMs: 0,
-  availableBufferRatio: 1,
-  jitterMs: 0,
-};
 export interface SearchArc extends LinkMetrics {
   nodes: number[];
 }
 const keys = new WeakMap<PathCandidate, string>();
+class Label implements PathCandidate {
+  private materialized?: number[];
+  constructor(
+    readonly parent: Label | undefined,
+    readonly suffix: number[],
+    readonly tail: number,
+    readonly visited: bigint,
+    readonly propagationDelayMs: number,
+    readonly availableBufferRatio: number,
+    readonly jitterMs: number,
+    readonly pathKey: string,
+  ) {}
+  get nodes(): number[] {
+    return (this.materialized ??= this.parent
+      ? [...this.parent.nodes, ...this.suffix]
+      : this.suffix);
+  }
+}
 const key = (p: PathCandidate) => {
+  if (p instanceof Label) return p.pathKey;
   let value = keys.get(p);
   if (value === undefined) {
     value = candidateId(p.nodes);
@@ -173,7 +187,6 @@ export function* boundedLabels(
   stats = emptySearch(),
   target?: number,
 ): Generator<void, Map<number, PathCandidate[]>> {
-  type Label = PathCandidate & { tail: number; visited: bigint };
   const prepared = new Map(
     [...adjacency].map(([node, arcs]) => [
       node,
@@ -191,12 +204,16 @@ export function* boundedLabels(
   );
   const labels = new Map<number, PathCandidate[]>();
   const heap = new Heap<Label>((a, b) => order(0, a, b));
-  const initial: Label = {
-    nodes: [source],
-    ...identity,
-    tail: source,
-    visited: 1n << BigInt(source),
-  };
+  const initial = new Label(
+    undefined,
+    [source],
+    source,
+    1n << BigInt(source),
+    0,
+    1,
+    0,
+    String(source),
+  );
   labels.set(source, [initial]);
   heap.push(initial);
   let current: Label | undefined;
@@ -210,7 +227,7 @@ export function* boundedLabels(
         structuredClone(stats),
       );
     stats.expandedStates++;
-    if (stats.expandedStates % 256 === 0) yield;
+    if (stats.expandedStates % 64 === 0) yield;
     if (node === target) {
       stats.completedPaths++;
       continue;
@@ -236,17 +253,16 @@ export function* boundedLabels(
           });
         continue;
       }
-      const parent = current;
-      let materialized: number[] | undefined;
-      const next: Label = {
-        get nodes() {
-          return (materialized ??= [...parent.nodes, ...suffix]);
-        },
-        ...metrics,
+      const next = new Label(
+        current,
+        suffix,
         tail,
-        visited: current.visited | mask,
-      };
-      keys.set(next, `${key(current)}:${suffixKey}`);
+        current.visited | mask,
+        metrics.propagationDelayMs,
+        metrics.availableBufferRatio,
+        metrics.jitterMs,
+        `${current.pathKey}:${suffixKey}`,
+      );
       if (prior.some((p) => key(p) === key(next))) continue;
       const retained = offer(prior, next, labelLimit);
       stats.boundedPruned =

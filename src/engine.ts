@@ -1,3 +1,5 @@
+import { RuntimeProfile } from "./performance";
+import type { ExecutionOptions } from "./performance";
 import { GroundAccess, GroundMetrics, validateGround } from "./ground";
 import type { GroundSettings, GroundView } from "./ground";
 import { diffMcsr } from "./mcsrStream";
@@ -323,6 +325,7 @@ type Event = {
 };
 class EventQueue {
   private heap: Event[] = [];
+  constructor(private profile?: RuntimeProfile) {}
   peek() {
     return this.heap[0];
   }
@@ -332,6 +335,9 @@ class EventQueue {
     );
   }
   push(e: Event) {
+    if (this.profile?.mode === "detail") this.profile.enter("queue.push");
+    this.profile?.count("queue.pushed");
+    this.profile?.maximum("queue.peakLength", this.heap.length + 1);
     const h = this.heap;
     h.push(e);
     let i = h.length - 1;
@@ -342,8 +348,11 @@ class EventQueue {
       i = p;
     }
     h[i] = e;
+    if (this.profile?.mode === "detail") this.profile.leave();
   }
   pop() {
+    if (this.profile?.mode === "detail") this.profile.enter("queue.pop");
+    this.profile?.count("queue.popped");
     const h = this.heap,
       first = h[0],
       last = h.pop()!;
@@ -358,6 +367,7 @@ class EventQueue {
       }
       h[i] = last;
     }
+    if (this.profile?.mode === "detail") this.profile.leave();
     return first;
   }
 }
@@ -375,7 +385,8 @@ export class SimulationEngine {
   private sourceNode = 0;
   private targetNode = 0;
   nowUs = 0;
-  private queue = new EventQueue();
+  private queue: EventQueue;
+  private runtimeProfile?: RuntimeProfile;
   private sequence = 0;
   private version = 0;
   private geometric = new Set<string>();
@@ -454,7 +465,13 @@ export class SimulationEngine {
     input: unknown,
     strategy?: RoutingStrategy,
     deferRouting = false,
+    private execution: ExecutionOptions = {},
   ) {
+    this.runtimeProfile =
+      execution.profile && execution.profile !== "off"
+        ? new RuntimeProfile(execution.profile)
+        : undefined;
+    this.queue = new EventQueue(this.runtimeProfile);
     const scenario = normalizeScenario(input);
     this.scenario = scenario;
     this.builtinMcsr = !strategy && scenario.routing.algorithm === "mcsr";
@@ -518,6 +535,7 @@ export class SimulationEngine {
         this.sourceNode,
         scenario.mcsrSearch,
         this.targetNode,
+        this.runtimeProfile,
       );
     if (this.mcsr && scenario.controlTransport.mode === "isl") {
       this.control = new ControlTransport(
@@ -529,6 +547,14 @@ export class SimulationEngine {
           schedule: (atUs, priority, run) => this.schedule(atUs, priority, run),
           graph: (domainId) => this.mcsr!.graph(domainId, false),
           availabilityKey: (domainId) => this.mcsr!.availabilityKey(domainId),
+          profile: this.runtimeProfile,
+          physicalState: (a, b) => {
+            const id = edgeId(a, b);
+            return {
+              available: this.physical.has(id),
+              token: this.tokens.get(id) ?? 0,
+            };
+          },
           physical: (a, b) => {
             const id = edgeId(a, b);
             const seconds = this.nowUs / SECOND;
@@ -586,7 +612,8 @@ export class SimulationEngine {
     this.committedPath = this.installedKey;
     this.committedValid = this.validPath();
     if (!this.pendingJob) this.observeService();
-    this.committedMcsr = this.mcsrView();
+    this.committedMcsr =
+      this.execution.render === false ? undefined : this.mcsrView();
     this.committedMcsrKey = this.mcsrStateKey(this.committedMcsr);
     this.committedGroundKey = JSON.stringify(this.groundView());
     this.scheduleTopology(SECOND);
@@ -828,6 +855,12 @@ export class SimulationEngine {
     const path = this.installedKey,
       pathValid = this.serviceDirty ? this.validPath() : this.committedValid;
     if (this.serviceDirty) this.observeService(pathValid);
+    if (this.execution.render === false) {
+      this.dirtyLinks.clear();
+      this.committedPath = path;
+      this.committedValid = pathValid;
+      return;
+    }
     const changedLinks: LinkChange[] = [];
     for (const id of [...this.dirtyLinks].sort()) {
       const previous = this.committedLinks.get(id)!;
@@ -905,6 +938,8 @@ export class SimulationEngine {
     return deltas;
   }
   checkpoint(): RenderCheckpoint {
+    if (this.execution.render === false)
+      throw new Error("Render streaming is disabled for this engine.");
     return {
       timeUs: this.nowUs,
       stateRevision: this.stateRevision,
@@ -1491,7 +1526,13 @@ export class SimulationEngine {
     ) {
       try {
         if (this.pendingJob) {
-          const step = this.pendingJob.next();
+          this.runtimeProfile?.enter("routing.globalSlice");
+          let step: IteratorResult<void, unknown>;
+          try {
+            step = this.pendingJob.next();
+          } finally {
+            this.runtimeProfile?.leave();
+          }
           if (!step.done) {
             if (Number.isFinite(budget)) return false;
             continue;
@@ -1502,11 +1543,37 @@ export class SimulationEngine {
         if (this.instantOpen) {
           if (this.queue.peek()?.atUs === this.nowUs) {
             if (processed >= budget) return false;
-            this.queue.pop().run();
+            const event = this.queue.pop();
+            this.runtimeProfile?.count("events.executed");
+            this.runtimeProfile?.count(`events.priority.${event.priority}`);
+            const timed =
+              this.runtimeProfile &&
+              (this.runtimeProfile.mode === "detail" ||
+                event.priority === 2.3 ||
+                event.priority === 2.35);
+            if (timed)
+              this.runtimeProfile!.enter(
+                event.priority === 2.3
+                  ? "control.delivery"
+                  : event.priority === 2.35
+                    ? "control.timeout"
+                    : "events.callback",
+              );
+            try {
+              event.run();
+            } finally {
+              if (timed) this.runtimeProfile!.leave();
+            }
             processed++;
             continue;
           }
-          this.commitInstant();
+          if (this.execution.render !== false)
+            this.runtimeProfile?.enter("render.streamCommit");
+          try {
+            this.commitInstant();
+          } finally {
+            if (this.execution.render !== false) this.runtimeProfile?.leave();
+          }
           this.instantOpen = false;
           continue;
         }
@@ -1540,6 +1607,9 @@ export class SimulationEngine {
     const done = !this.queue.peek() || this.queue.peek().atUs > targetUs;
     if (done) this.nowUs = targetUs;
     return done;
+  }
+  performanceReport() {
+    return this.runtimeProfile?.report() ?? null;
   }
   step() {
     if (this.failure) throw new Error(this.failure.message);

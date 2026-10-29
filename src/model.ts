@@ -74,6 +74,7 @@ export function inertial(
   plane: number,
   slot: number,
   seconds: number,
+  result: Vec3 = { x: 0, y: 0, z: 0 },
 ): Vec3 {
   const r = EARTH_RADIUS + c.altitude * 1000,
     node = (TAU * plane) / c.planes,
@@ -82,24 +83,28 @@ export function inertial(
       (TAU * c.phase * plane) / (c.planes * c.perPlane) +
       (TAU * seconds) / period(c),
     inc = (c.inclination * Math.PI) / 180;
-  return {
-    x:
-      r *
-      (Math.cos(node) * Math.cos(u) -
-        Math.sin(node) * Math.sin(u) * Math.cos(inc)),
-    y:
-      r *
-      (Math.sin(node) * Math.cos(u) +
-        Math.cos(node) * Math.sin(u) * Math.cos(inc)),
-    z: r * Math.sin(u) * Math.sin(inc),
-  };
+  result.x =
+    r *
+    (Math.cos(node) * Math.cos(u) -
+      Math.sin(node) * Math.sin(u) * Math.cos(inc));
+  result.y =
+    r *
+    (Math.sin(node) * Math.cos(u) +
+      Math.cos(node) * Math.sin(u) * Math.cos(inc));
+  result.z = r * Math.sin(u) * Math.sin(inc);
+  return result;
 }
-export function fixed(v: Vec3, a: number): Vec3 {
-  return {
-    x: v.x * Math.cos(a) + v.y * Math.sin(a),
-    y: -v.x * Math.sin(a) + v.y * Math.cos(a),
-    z: v.z,
-  };
+export function fixed(
+  v: Vec3,
+  a: number,
+  result: Vec3 = { x: 0, y: 0, z: 0 },
+): Vec3 {
+  const x = v.x * Math.cos(a) + v.y * Math.sin(a),
+    y = -v.x * Math.sin(a) + v.y * Math.cos(a);
+  result.x = x;
+  result.y = y;
+  result.z = v.z;
+  return result;
 }
 export function position(
   c: Config,
@@ -112,14 +117,20 @@ export function position(
     gmst(startMs + seconds * 1000),
   );
 }
-export function positions(c: Config, seconds: number, startMs: number): Vec3[] {
+export function positions(
+  c: Config,
+  seconds: number,
+  startMs: number,
+  result: Vec3[] = [],
+): Vec3[] {
   const a = gmst(startMs + seconds * 1000);
-  return Array.from({ length: c.planes * c.perPlane }, (_, id) =>
-    fixed(
-      inertial(c, Math.floor(id / c.perPlane), id % c.perPlane, seconds),
-      a,
-    ),
-  );
+  result.length = c.planes * c.perPlane;
+  for (let id = 0; id < result.length; id++) {
+    const out = (result[id] ??= { x: 0, y: 0, z: 0 });
+    inertial(c, Math.floor(id / c.perPlane), id % c.perPlane, seconds, out);
+    fixed(out, a, out);
+  }
+  return result;
 }
 export function distance(a: Vec3, b: Vec3) {
   return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
