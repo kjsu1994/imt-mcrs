@@ -1,10 +1,12 @@
 ﻿$ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+$usingWslDocker = $false
 
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     docker compose up -d --build
     if ($LASTEXITCODE -ne 0) { throw 'Docker Compose failed.' }
 } else {
+    $usingWslDocker = $true
     # WSL cannot read this machine's O: cloud drive; stage only build inputs on C:.
     wsl -d Ubuntu --cd / --exec docker info --format '{{.ServerVersion}}'
     if ($LASTEXITCODE -ne 0) { throw 'Start Docker in WSL Ubuntu first.' }
@@ -32,4 +34,6 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         }
     }
 }
+& (Join-Path $PSScriptRoot 'docker-lan.ps1') -Wsl:$usingWslDocker
 Write-Host 'MCSR simulator: http://localhost:5174'
+Write-Host 'LAN access: http://<Windows LAN IPv4>:5174 (5714 also available)'

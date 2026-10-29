@@ -4,5 +4,6 @@ services:
     image: mcsr-sim:local
     build: .
     ports:
-      - "127.0.0.1:5174:80"
+      - "0.0.0.0:5174:80"
+      - "0.0.0.0:5714:80"
     restart: unless-stopped
