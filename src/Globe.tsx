@@ -295,17 +295,6 @@ export default function Globe(props: Props) {
           previewKey = "";
           orbits.removeAll();
           for (let id = 0; id < config.planes * config.perPlane; id++) {
-            dsLabels.add({
-              position: Cartesian3.ZERO,
-              text: "",
-              show: false,
-              font: "12px sans-serif",
-              fillColor: Color.WHITE,
-              showBackground: true,
-              backgroundColor:
-                Color.fromCssColorString("#101827").withAlpha(0.85),
-              pixelOffset: new Cartesian2(0, -30),
-            });
             satelliteIcons.add({
               id,
               position: Cartesian3.ZERO,
@@ -357,17 +346,41 @@ export default function Globe(props: Props) {
           EARTH_RADIUS + p.config.altitude * 1000 + iconDistance;
         satelliteIcons.show = iconView;
         const srd = p.showSrds ? display?.mcsr : undefined;
+        if (dsLabels.length !== (srd?.domains.length ?? 0)) {
+          dsLabels.removeAll();
+          for (const domain of srd?.domains ?? [])
+            dsLabels.add({
+              position: Cartesian3.ZERO,
+              text: `DS · S${domain.id}`,
+              font: "12px sans-serif",
+              fillColor: Color.WHITE,
+              showBackground: true,
+              backgroundColor:
+                Color.fromCssColorString("#101827").withAlpha(0.85),
+              pixelOffset: new Cartesian2(0, -30),
+            });
+        }
+        for (let i = 0; i < dsLabels.length; i++) {
+          const domain = srd!.domains[i],
+            label = dsLabels.get(i);
+          label.position = scenePositions[domain.ds];
+          label.show =
+            dsLabels.length <= 16 ||
+            domain.id === srd!.sourceDomain ||
+            domain.id === srd!.membership[p.target] ||
+            (p.selected !== null &&
+              domain.id === srd!.membership[p.selected]) ||
+            Cartesian3.distance(viewer.camera.positionWC, label.position) <
+              iconDistance / 2;
+        }
         const styleKey = `${p.selected}:${p.source}:${p.target}:${srd?.membership.join(":") ?? ""}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
           dot.position = scenePositions[id];
           if (iconView) satelliteIcons.get(id).position = scenePositions[id];
-          dsLabels.get(id).position = scenePositions[id];
           if (styleKey !== lastStyle) {
             const domain = srd?.domains[srd.membership[id]];
             const isDs = domain?.ds === id;
-            dsLabels.get(id).show = isDs;
-            dsLabels.get(id).text = isDs ? `DS · S${domain!.id}` : "";
             satelliteIcons.get(id).color = srd
               ? Color.fromCssColorString(
                   palette[srd.membership[id] % palette.length],

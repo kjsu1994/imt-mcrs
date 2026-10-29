@@ -21,12 +21,13 @@ export type Command =
   | { type: "finish"; runId: number }
   | { type: "export"; runId: number; what: "scenario" | "result" };
 export type Reply =
+  | { type: "busy"; runId: number }
   | {
       type: "state";
       runId: number;
       progress: Omit<
         ReturnType<SimulationEngine["progress"]>,
-        "serviceOutages" | "linkFailures"
+        "serviceOutages" | "linkFailures" | "mcsr"
       >;
       histories?: Pick<
         ReturnType<SimulationEngine["progress"]>,

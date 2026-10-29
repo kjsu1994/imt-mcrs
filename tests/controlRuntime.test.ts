@@ -19,7 +19,7 @@ test("v7 requires control settings and v6 keeps the fixed delivery model", () =>
     mode: "fixed",
     ackTimeoutUs: 1000000,
   });
-  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.schemaVersion, 8);
   const normalized = new SimulationEngine(migrated),
     legacy = new SimulationEngine(old);
   normalized.advanceTo(old.durationUs);

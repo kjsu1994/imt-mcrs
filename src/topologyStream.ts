@@ -1,3 +1,4 @@
+import { applyMcsr } from "./mcsrStream";
 import type { LinkState, RenderCheckpoint, TopologyDelta } from "./engine";
 
 export class TopologyStream {
@@ -45,7 +46,11 @@ export class TopologyStream {
         ...this.received,
         ...d.route,
         ...(d.analysis ? { analysis: d.analysis } : {}),
-        ...(d.mcsr ? { mcsr: d.mcsr } : {}),
+        ...(d.mcsr
+          ? { mcsr: d.mcsr }
+          : d.mcsrDelta
+            ? { mcsr: applyMcsr(this.received.mcsr, d.mcsrDelta) }
+            : {}),
         timeUs: d.timeUs,
         stateRevision: d.stateRevision,
         version: d.version,
@@ -90,7 +95,11 @@ export class TopologyStream {
         ...this.displayed,
         ...d.route,
         ...(d.analysis ? { analysis: d.analysis } : {}),
-        ...(d.mcsr ? { mcsr: d.mcsr } : {}),
+        ...(d.mcsr
+          ? { mcsr: d.mcsr }
+          : d.mcsrDelta
+            ? { mcsr: applyMcsr(this.displayed.mcsr, d.mcsrDelta) }
+            : {}),
         stateRevision: d.stateRevision,
         version: d.version,
       };
@@ -101,6 +110,9 @@ export class TopologyStream {
     if (changed) this.displayed.links = [...this.visible.values()];
     this.displayed.timeUs = timeUs;
     return this.displayed;
+  }
+  get latestMcsr() {
+    return this.received?.mcsr;
   }
   get pendingCount() {
     return this.pending.length;

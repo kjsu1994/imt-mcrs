@@ -1,3 +1,6 @@
+import { searchDefaults } from "./boundedSearch";
+import mcsr72 from "../examples/mcsr-72.json";
+import mcsr1584 from "../examples/mcsr-1584.json";
 import { useState, useMemo, useEffect } from "react";
 import Globe from "./Globe";
 import mcsrExample from "../examples/mcsr-routing.json";
@@ -23,6 +26,7 @@ const controlReason = (reason: string) =>
     expired: "전달 제한 시간 초과",
     "ack-timeout": "ACK 제한 시간 초과",
     "superseded-attempt": "이전 전송의 ACK",
+    "csib-base-mismatch": "CSIB 기준 버전 불일치",
   })[reason] ?? reason;
 import { useSimulation } from "./useSimulation";
 const initial: Telemetry = { latitude: 0, longitude: 0, altitude: 0 };
@@ -90,6 +94,10 @@ export default function App() {
     if (simulation.ended || simulation.failed) setPlaying(false);
   }, [simulation.ended, simulation.failed]);
   const frame = simulation.frame;
+  const inputVersions =
+    frame?.routingAnalysis.mcsr?.dependencies
+      .map((d) => `S${d.domainId} v${d.revision}`)
+      .join(" · ") ?? "";
   const preview = frame?.routingAnalysis.candidates.find(
     (c) => c.id === previewId,
   );
@@ -119,6 +127,15 @@ export default function App() {
   }
   function updateRouting(routing: RoutingSettings) {
     const next = { ...structuredClone(frame?.scenario ?? scenario), routing };
+    if (
+      routing.algorithm === "mcsr" &&
+      config.planes * config.perPlane > 16 &&
+      next.mcsrSearch.mode === "reference"
+    ) {
+      const defaults = createScenario(config, startMs, source, target);
+      next.mcsrSearch = defaults.mcsrSearch;
+      next.srd = defaults.srd;
+    }
     validateScenario(next);
     setLoadedScenario(next);
   }
@@ -514,17 +531,7 @@ export default function App() {
                   }
                 >
                   <option value="bfs">BFS · 최단 홉</option>
-                  <option
-                    value="mcsr"
-                    disabled={
-                      config.planes * config.perPlane > DOMINANT_NODE_LIMIT
-                    }
-                  >
-                    MCSR · 영역별 라우팅
-                    {config.planes * config.perPlane > DOMINANT_NODE_LIMIT
-                      ? " (16기 이하 필요)"
-                      : ""}
-                  </option>
+                  <option value="mcsr">MCSR · 영역별 라우팅</option>
                   <option
                     value="dominant-paths"
                     disabled={
@@ -554,8 +561,69 @@ export default function App() {
               >
                 MCSR 예제 불러오기 · 16기
               </button>
+              <div
+                className="field-grid"
+                style={{ gridTemplateColumns: "1fr" }}
+              >
+                {[
+                  { name: "72기", data: mcsr72 },
+                  { name: "1,584기", data: mcsr1584 },
+                ].map(({ name, data }) => (
+                  <button
+                    key={name}
+                    onClick={() =>
+                      void importScenario(
+                        new File([JSON.stringify(data)], `mcsr-${name}.json`, {
+                          type: "application/json",
+                        }),
+                      )
+                    }
+                  >
+                    MCSR 예제 · {name}
+                  </button>
+                ))}
+              </div>
               {scenario.routing.algorithm === "mcsr" && (
                 <div className="srd-settings" aria-label="SRD 설정">
+                  <label className="field">
+                    탐색 모드
+                    <select
+                      aria-label="MCSR 탐색 모드"
+                      value={scenario.mcsrSearch.mode}
+                      onChange={(e) => {
+                        const next = {
+                          ...structuredClone(frame?.scenario ?? scenario),
+                          mcsrSearch: searchDefaults(
+                            config.planes * config.perPlane,
+                            e.target.value as "reference" | "bounded",
+                          ),
+                        };
+                        validateScenario(next);
+                        setLoadedScenario(next);
+                      }}
+                    >
+                      <option
+                        value="reference"
+                        disabled={config.planes * config.perPlane > 16}
+                      >
+                        정밀 검증 · 16기 이하
+                      </option>
+                      <option value="bounded">확장 · 제한 후보 탐색</option>
+                    </select>
+                  </label>
+                  {scenario.mcsrSearch.mode === "bounded" && (
+                    <p className="model-caption" aria-label="탐색 제한">
+                      전체 우세 경로 보장 없음 · 내부{" "}
+                      {scenario.mcsrSearch.localCandidates} / 경계{" "}
+                      {scenario.mcsrSearch.labelsPerBoundary} / 종단{" "}
+                      {scenario.mcsrSearch.endCandidates}개<br />
+                      탐색 {scenario.mcsrSearch.expansionLimit.toLocaleString()}
+                      회 · D 갱신{" "}
+                      {scenario.mcsrSearch.delayPublishIntervalUs / SECOND}초 ·
+                      속성·재선택 묶음{" "}
+                      {scenario.mcsrSearch.metricCoalesceUs / 1000}ms
+                    </p>
+                  )}
                   <div className="field-grid">
                     {(
                       [
@@ -579,7 +647,20 @@ export default function App() {
                           }
                         >
                           {Array.from({ length: max }, (_, i) => (
-                            <option key={i + 1} value={i + 1}>
+                            <option
+                              key={i + 1}
+                              value={i + 1}
+                              disabled={
+                                scenario.mcsrSearch.mode === "bounded" &&
+                                (i + 1) *
+                                  scenario.srd[
+                                    key === "planesPerDomain"
+                                      ? "satellitesPerDomain"
+                                      : "planesPerDomain"
+                                  ] >
+                                  32
+                              }
+                            >
                               {i + 1}
                             </option>
                           ))}
@@ -924,21 +1005,42 @@ export default function App() {
                     SRD {frame.mcsr.domains.length}개 · 출발 영역 S
                     {frame.mcsr.sourceDomain}
                   </p>
+                  {frame.routingAnalysis.search?.coverage === "bounded" && (
+                    <p className="model-caption">
+                      탐색{" "}
+                      {frame.routingAnalysis.search.expandedStates.toLocaleString()}
+                      회 · 제한 제외{" "}
+                      {(
+                        frame.routingAnalysis.search.boundedPruned ?? 0
+                      ).toLocaleString()}
+                      건
+                    </p>
+                  )}
                   {frame.routingAnalysis.mcsr && (
                     <>
                       <p className="model-caption">
-                        {frame.routingAnalysis.mcsr.comparison?.matched
-                          ? "기준 탐색 일치"
-                          : frame.routingAnalysis.mcsr.synchronized
-                            ? "기준 비교 없음 · 저장 후보"
-                            : "정보 전달 중 · 기준 비교 대기"}
+                        {frame.routingAnalysis.mcsr.coverage === "bounded"
+                          ? "제한 후보 검증 · 전체 우세 경로 보장 없음"
+                          : frame.routingAnalysis.mcsr.comparison?.matched
+                            ? "기준 탐색 일치"
+                            : frame.routingAnalysis.mcsr.synchronized
+                              ? "기준 비교 없음 · 저장 후보"
+                              : "정보 전달 중 · 기준 비교 대기"}
                       </p>
-                      <p className="model-caption">
-                        계산 입력:{" "}
-                        {frame.routingAnalysis.mcsr.dependencies
-                          .map((d) => `S${d.domainId} v${d.revision}`)
-                          .join(" · ")}
-                      </p>
+                      {frame.routingAnalysis.mcsr.dependencies.length > 12 ? (
+                        <details>
+                          <summary>
+                            계산 입력 ·{" "}
+                            {frame.routingAnalysis.mcsr.dependencies.length}개
+                            SRD
+                          </summary>
+                          <p className="model-caption">{inputVersions}</p>
+                        </details>
+                      ) : (
+                        <p className="model-caption">
+                          계산 입력: {inputVersions}
+                        </p>
+                      )}
                     </>
                   )}
                   {frame.mcsr.control && (
@@ -947,11 +1049,21 @@ export default function App() {
                       aria-label="제어 통신 상태"
                     >
                       <p className="model-caption">
-                        ACK 대기 {frame.mcsr.control.pending.length}건 · 전송 중{" "}
-                        {frame.mcsr.control.flights.length}건 · 재전송{" "}
-                        {frame.mcsr.control.stats.retries}회 · 실패{" "}
+                        ACK 대기{" "}
+                        {frame.mcsr.control.pendingTotal ??
+                          frame.mcsr.control.pending.length}
+                        건 · 전송 중{" "}
+                        {frame.mcsr.control.flightsTotal ??
+                          frame.mcsr.control.flights.length}
+                        건 · 재전송 {frame.mcsr.control.stats.retries}회 · 실패{" "}
                         {frame.mcsr.control.stats.dropped}건
                       </p>
+                      {frame.mcsr.control.focusDomain !== undefined && (
+                        <p className="model-caption">
+                          화면: 출발 SRD 송수신 · 최대 256개 · 상세 로그 생략{" "}
+                          {frame.mcsr.control.traceOmitted ?? 0}건
+                        </p>
+                      )}
                       <details>
                         <summary>DS별 전송 대기</summary>
                         <ol className="event-list">
@@ -1004,6 +1116,7 @@ export default function App() {
                                     timeout: "ACK 시간초과",
                                     acknowledged: "ACK 확인",
                                     "ack-ignored": "이전 ACK 제외",
+                                    "resync-requested": "전체 상태 요청",
                                   }[e.type]
                                 }
                                 {e.reason
@@ -1114,18 +1227,25 @@ export default function App() {
                     "candidate-row " + (previewId === c.id ? "active" : "")
                   }
                   key={c.id}
+                  title={c.nodes.join(" → ")}
                   aria-pressed={previewId === c.id}
                   onClick={() => setPreviewId(previewId === c.id ? "" : c.id)}
                 >
-                  <strong>{c.nodes.join(" → ")}</strong>
+                  <strong>
+                    {c.nodes.length > 16
+                      ? `${c.nodes.slice(0, 3).join(" → ")} → … → ${c.nodes.slice(-3).join(" → ")} (${c.nodes.length}노드)`
+                      : c.nodes.join(" → ")}
+                  </strong>
                   {frame.routingAnalysis.mcsr?.segments.find(
                     (s) => s.candidateId === c.id,
                   ) && (
                     <small>
                       {frame.routingAnalysis.mcsr.segments
                         .find((s) => s.candidateId === c.id)!
-                        .runs.map(
-                          (r) => `S${r.domainId} [${r.nodes.join(" → ")}]`,
+                        .runs.map((r) =>
+                          c.nodes.length > 16
+                            ? `S${r.domainId}`
+                            : `S${r.domainId} [${r.nodes.join(" → ")}]`,
                         )
                         .join(" → ")}
                     </small>

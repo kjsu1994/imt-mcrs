@@ -1,8 +1,19 @@
+import { diffMcsr } from "./mcsrStream";
+import type { McsrDelta } from "./mcsrStream";
+import { searchDefaults, runSearch } from "./boundedSearch";
+import type { McsrSearchSettings } from "./boundedSearch";
 import { ControlTransport, ControlTransportError } from "./controlTransport";
 import type { ControlSettings } from "./controlTransport";
 import { McsrController } from "./mcsr";
 import type { SrdSettings, McsrView } from "./mcsr";
-import { mesh, positions, activeEdges, pathLength, validate } from "./model";
+import {
+  mesh,
+  position,
+  positions,
+  activeEdges,
+  pathLength,
+  validate,
+} from "./model";
 import type { Config } from "./model";
 import { MetricsEngine } from "./metrics";
 import {
@@ -29,11 +40,12 @@ import type {
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "mcsr-control-v7";
+export const MODEL_VERSION = "mcsr-scale-v8";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 7;
+  schemaVersion: 8;
+  mcsrSearch: McsrSearchSettings;
   config: Config;
   srd: SrdSettings;
   controlTransport: ControlSettings;
@@ -68,11 +80,18 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
+    mcsrSearch: searchDefaults(config.planes * config.perPlane),
     config: { ...config },
     srd: {
-      planesPerDomain: Math.min(2, config.planes),
-      satellitesPerDomain: Math.min(2, config.perPlane),
+      planesPerDomain: Math.min(
+        config.planes * config.perPlane > 72 ? 6 : 2,
+        config.planes,
+      ),
+      satellitesPerDomain: Math.min(
+        config.planes * config.perPlane <= 16 ? 2 : 4,
+        config.perPlane,
+      ),
     },
     controlTransport: { mode: "isl", ackTimeoutUs: SECOND },
     epochMs,
@@ -102,20 +121,28 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 4 &&
     version !== 5 &&
     version !== 6 &&
-    version !== 7
+    version !== 7 &&
+    version !== 8
   )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 7 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 8 } as Scenario;
   if (
     version !== 3 &&
     version !== 4 &&
     version !== 5 &&
     version !== 6 &&
     version !== 7 &&
+    version !== 8 &&
     scenario.linkMetricUpdates === undefined
   )
     scenario.linkMetricUpdates = [];
-  if (version !== 4 && version !== 5 && version !== 6 && version !== 7) {
+  if (
+    version !== 4 &&
+    version !== 5 &&
+    version !== 6 &&
+    version !== 7 &&
+    version !== 8
+  ) {
     scenario.routing ??= {
       algorithm: "bfs",
       service: "LS",
@@ -124,13 +151,18 @@ export function normalizeScenario(input: unknown): Scenario {
     scenario.notificationDelayUs ??= 0;
     scenario.switchDelayUs ??= 0;
   }
-  if (version !== 6 && version !== 7)
+  if (version !== 6 && version !== 7 && version !== 8)
     scenario.srd = {
       planesPerDomain: Math.min(2, scenario.config?.planes),
       satellitesPerDomain: Math.min(2, scenario.config?.perPlane),
     };
-  if (version !== 7)
+  if (version !== 7 && version !== 8)
     scenario.controlTransport = { mode: "fixed", ackTimeoutUs: SECOND };
+  if (version !== 8)
+    scenario.mcsrSearch = searchDefaults(
+      scenario.config?.planes * scenario.config?.perPlane,
+      "reference",
+    );
   validateScenario(scenario);
   return scenario;
 }
@@ -146,6 +178,7 @@ export type TopologyDelta = {
   route?: { path: number[]; pathValid: boolean };
   analysis?: RoutingAnalysis;
   mcsr?: McsrView;
+  mcsrDelta?: McsrDelta;
 };
 export type RenderCheckpoint = {
   timeUs: number;
@@ -164,7 +197,7 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 7)
+  if (s.schemaVersion !== 8)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
   if (
     !s.controlTransport ||
@@ -172,9 +205,27 @@ export function validateScenario(s: Scenario) {
   )
     throw new Error("잘못된 제어 통신 모드입니다.");
   integer(s.controlTransport.ackTimeoutUs, 1, 86400 * SECOND, "ACK 제한 시간");
+  if (!s.mcsrSearch || !["reference", "bounded"].includes(s.mcsrSearch.mode))
+    throw new Error("MCSR 탐색 모드가 필요합니다.");
+  for (const [key, min, max] of [
+    ["localCandidates", 1, 16],
+    ["labelsPerBoundary", 1, 64],
+    ["endCandidates", 1, 64],
+    ["expansionLimit", 1, 10000000],
+    ["delayPublishIntervalUs", 1000000, 86400 * SECOND],
+    ["metricCoalesceUs", 0, SECOND],
+    ["traceLimit", 24, 100000],
+    ["controlEventLimit", 1, 50000000],
+  ] as const)
+    integer(s.mcsrSearch[key], min, max, `MCSR ${key}`);
   if (!s.srd) throw new Error("SRD 설정이 필요합니다.");
   integer(s.srd.planesPerDomain, 1, s.config.planes, "SRD 궤도면 수");
   integer(s.srd.satellitesPerDomain, 1, s.config.perPlane, "SRD 슬롯 수");
+  if (
+    s.mcsrSearch.mode === "bounded" &&
+    s.srd.planesPerDomain * s.srd.satellitesPerDomain > 32
+  )
+    throw new Error("확장 모드 SRD는 32기 이하로 분할하세요.");
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
   integer(s.epochMs, 0, 8640000000000000, "시작 시각");
@@ -201,7 +252,8 @@ export function validateScenario(s: Scenario) {
   )
     throw new Error("잘못된 라우팅 설정입니다.");
   if (
-    ["dominant-paths", "mcsr"].includes(s.routing.algorithm) &&
+    (s.routing.algorithm === "dominant-paths" ||
+      (s.routing.algorithm === "mcsr" && s.mcsrSearch.mode === "reference")) &&
     s.config.planes * s.config.perPlane > DOMINANT_NODE_LIMIT
   )
     throw new Error("자동 우세 경로는 16기 이하 성좌를 적용한 뒤 선택하세요.");
@@ -310,6 +362,8 @@ export class SimulationEngine {
   private missed = new Map<string, number>();
   private tokens = new Map<string, number>();
   private installed: number[] = [];
+  private installedKey = "";
+  private serviceDirty = true;
   private linkLoads = new Map<string, LinkLoad>();
   private installedEvaluation: {
     evaluatedUs: number;
@@ -328,18 +382,39 @@ export class SimulationEngine {
     search?: DominantSearchSummary;
   } | null = null;
   private strategy: RoutingStrategy;
+  private builtinMcsr: boolean;
   private mcsr?: McsrController;
   private control?: ControlTransport;
-  private routeInstalledAtUs = -1;
-  private routeInstalledMode: "initial" | "reserve" | "recalculate" = "initial";
+  private routeRestoredAtUs = -1;
+  private routeRestoredMode: "initial" | "reserve" | "recalculate" = "initial";
   private committedMcsrKey = "";
+  private committedMcsr?: McsrView;
   private inputRevision = 0;
   private requestAtUs = -1;
   private requestedVersion = -1;
 
   private cachedCandidates: PathCandidate[] = [];
   private analyses: RoutingAnalysis[] = [];
-  private analysis!: RoutingAnalysis;
+  private analysis: RoutingAnalysis = {
+    status: "pending",
+    id: 0,
+    atUs: 0,
+    inputRevision: 0,
+    algorithm: "",
+    service: "LS",
+    mode: "initial",
+    trigger: "initial",
+    selectedId: null,
+    candidates: [],
+  };
+  private pendingJob?: Generator<void, unknown>;
+  private instantOpen = false;
+  get needsWork() {
+    return !!this.pendingJob || this.instantOpen;
+  }
+  nextEventUs() {
+    return this.queue.peek()?.atUs ?? this.scenario.durationUs;
+  }
   private committedAnalysisKey = "";
   private previousDelays: number[] = [];
   private delayChanged = false;
@@ -352,9 +427,14 @@ export class SimulationEngine {
   private committedValid = false;
   private stateRevision = 0;
   private deltas: TopologyDelta[] = [];
-  constructor(input: unknown, strategy?: RoutingStrategy) {
+  constructor(
+    input: unknown,
+    strategy?: RoutingStrategy,
+    deferRouting = false,
+  ) {
     const scenario = normalizeScenario(input);
     this.scenario = scenario;
+    this.builtinMcsr = !strategy && scenario.routing.algorithm === "mcsr";
     this.strategy =
       strategy ??
       createRoutingStrategy(scenario.routing, {
@@ -398,6 +478,8 @@ export class SimulationEngine {
         scenario.srd,
         this.observedGraph(),
         scenario.source,
+        scenario.mcsrSearch,
+        scenario.target,
       );
     if (this.mcsr && scenario.controlTransport.mode === "isl") {
       this.control = new ControlTransport(
@@ -407,88 +489,50 @@ export class SimulationEngine {
         {
           nowUs: () => this.nowUs,
           schedule: (atUs, priority, run) => this.schedule(atUs, priority, run),
-          graph: (domainId) => this.mcsr!.graph(domainId),
+          graph: (domainId) => this.mcsr!.graph(domainId, false),
+          availabilityKey: (domainId) => this.mcsr!.availabilityKey(domainId),
           physical: (a, b) => {
-            const id = edgeId(a, b),
-              p = positions(
-                scenario.config,
-                this.nowUs / SECOND,
-                scenario.epochMs,
-              );
+            const id = edgeId(a, b);
+            const seconds = this.nowUs / SECOND;
             return {
               available: this.physical.has(id),
               token: this.tokens.get(id) ?? 0,
               delayUs: Math.max(
                 1,
                 Math.ceil(
-                  linkMetrics(p[a], p[b], DEFAULT_LINK_LOAD)
-                    .propagationDelayMs * 1000,
+                  linkMetrics(
+                    position(scenario.config, a, seconds, scenario.epochMs),
+                    position(scenario.config, b, seconds, scenario.epochMs),
+                    DEFAULT_LINK_LOAD,
+                  ).propagationDelayMs * 1000,
                 ),
               ),
             };
           },
-          receive: (ad, recipient) => {
-            const beforeGraph = this.mcsr!.graph();
-            const previous = this.mcsr!.inputKey(),
-              accepted = this.mcsr!.receive(ad, recipient, this.nowUs);
-            this.metrics.record({
-              atUs: this.nowUs,
-              type: accepted ? "csib-received" : "csib-discarded",
-              domainId: ad.domainId,
-              recipientDomainId: recipient,
-              version: ad.revision,
-            });
-            if (previous !== this.mcsr!.inputKey()) {
-              const afterGraph = this.mcsr!.graph(),
-                byId = new Map(afterGraph.links.map((l) => [l.id, l]));
-              const down = beforeGraph.links.some(
-                (l) => l.knownAvailable && !byId.get(l.id)?.knownAvailable,
-              );
-              const beforeIds = new Set(
-                beforeGraph.links
-                  .filter((l) => l.knownAvailable)
-                  .map((l) => l.id),
-              );
-              const up = afterGraph.links.some(
-                (l) => l.knownAvailable && !beforeIds.has(l.id),
-              );
-              const changedMetrics = beforeGraph.links.some((l) => {
-                const next = byId.get(l.id);
-                return (
-                  l.knownAvailable &&
-                  next?.knownAvailable &&
-                  JSON.stringify(l.metrics) !== JSON.stringify(next.metrics)
-                );
-              });
-              this.inputsChanged(
-                down && !up && !changedMetrics ? "link-down" : "csib-update",
-              );
-            }
-            return accepted;
-          },
+          receive: (ad, recipient) =>
+            this.receiveMcsr(ad.domainId, ad.revision, recipient, () =>
+              this.mcsr!.receive(ad, recipient, this.nowUs),
+            )!,
+          receiveDelta: (delta, recipient) =>
+            this.receiveMcsr(delta.domainId, delta.revision, recipient, () =>
+              this.mcsr!.receiveDelta(delta, recipient, this.nowUs),
+            ),
+          initialAdvertisement: (domainId) =>
+            this.mcsr!.initialAdvertisement(domainId),
         },
+        scenario.mcsrSearch.mode === "bounded"
+          ? {
+              eventLimit: scenario.mcsrSearch.controlEventLimit,
+              traceLimit: scenario.mcsrSearch.traceLimit,
+              focusDomain: this.mcsr.sourceDomain,
+            }
+          : undefined,
       );
     }
-    const initial = this.calculate();
-    this.cachedCandidates = initial.candidates;
-    const chosen = this.decide(
-      initial.candidates,
-      "initial",
-      "initial",
-      [],
-      initial.search,
-    );
-    this.installed = chosen?.nodes ?? [];
-    this.installedEvaluation = {
-      evaluatedUs: initial.evaluatedUs,
-      candidate: chosen,
-    };
-    this.metrics.record({
-      atUs: 0,
-      type: "route-installed",
-      path: this.installed,
-      version: 0,
-    });
+    if (deferRouting) {
+      this.pendingJob = this.initializeRouting();
+      this.instantOpen = true;
+    } else runSearch(this.initializeRouting());
     for (const [a, b] of this.edges) {
       const id = edgeId(a, b);
       this.committedLinks.set(id, {
@@ -501,11 +545,84 @@ export class SimulationEngine {
       });
     }
     this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
-    this.committedPath = this.installed.join(":");
+    this.committedPath = this.installedKey;
     this.committedValid = this.validPath();
-    this.observeService();
+    if (!this.pendingJob) this.observeService();
+    this.committedMcsr = this.mcsrView();
+    this.committedMcsrKey = this.mcsrStateKey(this.committedMcsr);
     this.scheduleTopology(SECOND);
     for (const e of scenario.failures) this.scheduleFailure(e);
+  }
+  private receiveMcsr(
+    domainId: number,
+    revision: number,
+    recipient: number,
+    apply: () => boolean | null,
+  ): boolean | null {
+    const affectsSource = recipient === this.mcsr!.sourceDomain;
+    const beforeGraph = affectsSource
+      ? this.mcsr!.graph(undefined, false)
+      : undefined;
+    const previous = this.mcsr!.inputKey(),
+      accepted = apply();
+    if (accepted === null) return null;
+    if (affectsSource && accepted) this.serviceDirty = true;
+    this.metrics.record({
+      atUs: this.nowUs,
+      type: accepted ? "csib-received" : "csib-discarded",
+      domainId: domainId,
+      recipientDomainId: recipient,
+      version: revision,
+    });
+    if (affectsSource && previous !== this.mcsr!.inputKey()) {
+      const afterGraph = this.mcsr!.graph(undefined, false),
+        byId = new Map(afterGraph.links.map((l) => [l.id, l]));
+      const down = beforeGraph!.links.some(
+        (l) => l.knownAvailable && !byId.get(l.id)?.knownAvailable,
+      );
+      const beforeIds = new Set(
+        beforeGraph!.links.filter((l) => l.knownAvailable).map((l) => l.id),
+      );
+      const up = afterGraph.links.some(
+        (l) => l.knownAvailable && !beforeIds.has(l.id),
+      );
+      const changedMetrics = beforeGraph!.links.some((l) => {
+        const next = byId.get(l.id);
+        return (
+          l.knownAvailable &&
+          next?.knownAvailable &&
+          JSON.stringify(l.metrics) !== JSON.stringify(next.metrics)
+        );
+      });
+      this.inputsChanged(
+        down && !up && !changedMetrics ? "link-down" : "csib-update",
+      );
+    }
+    return accepted;
+  }
+  private *initializeRouting(): Generator<void, void> {
+    const initial = yield* this.calculateSteps();
+    this.cachedCandidates = initial.candidates;
+    const chosen = this.decide(
+      initial.candidates,
+      "initial",
+      "initial",
+      [],
+      initial.search,
+    );
+    this.installed = chosen?.nodes ?? [];
+    this.installedKey = this.installed.join(":");
+    this.serviceDirty = true;
+    this.installedEvaluation = {
+      evaluatedUs: initial.evaluatedUs,
+      candidate: chosen,
+    };
+    this.metrics.record({
+      atUs: 0,
+      type: "route-installed",
+      path: this.installed,
+      version: 0,
+    });
   }
   private schedule(atUs: number, priority: number, run: () => void) {
     if (atUs <= this.scenario.durationUs)
@@ -577,9 +694,11 @@ export class SimulationEngine {
       }
     });
   }
-  private observeService() {
+  private observeService(available = this.validPath()) {
     const missing = new Set<string>();
-    for (const path of [this.installed, this.metrics.previousPath]) {
+    for (const path of !available || this.metrics.previousPath.length
+      ? [this.installed, this.metrics.previousPath]
+      : []) {
       for (let i = 1; i < path.length; i++) {
         const id = edgeId(path[i - 1], path[i]);
         if (!this.physical.has(id)) missing.add(id);
@@ -588,18 +707,21 @@ export class SimulationEngine {
     this.metrics.observe(
       this.nowUs,
       this.installed,
-      this.validPath(),
+      available,
       [...missing].sort(),
       this.detectedLinks,
-      !this.validPath() || this.metrics.previousPath.length
-        ? this.graph()
+      !available || this.metrics.previousPath.length
+        ? this.routingGraph()
         : undefined,
-      this.routeInstalledAtUs === this.nowUs ? this.routeInstalledMode : null,
+      this.routeRestoredAtUs === this.nowUs ? this.routeRestoredMode : null,
     );
     this.detectedLinks.clear();
+    this.serviceDirty = false;
   }
   private commitInstant() {
-    this.observeService();
+    const path = this.installedKey,
+      pathValid = this.serviceDirty ? this.validPath() : this.committedValid;
+    if (this.serviceDirty) this.observeService(pathValid);
     const changedLinks: LinkChange[] = [];
     for (const id of [...this.dirtyLinks].sort()) {
       const previous = this.committedLinks.get(id)!;
@@ -624,23 +746,28 @@ export class SimulationEngine {
       }
     }
     this.dirtyLinks.clear();
-    const path = this.installed.join(":"),
-      pathValid = this.validPath();
     const routeChanged =
       path !== this.committedPath || pathValid !== this.committedValid;
     const analysisChanged =
       `${this.analysis.id}:${this.analysis.status}` !==
       this.committedAnalysisKey;
-    const mcsr = this.mcsrView();
-    const mcsrKey = mcsr ? JSON.stringify(mcsr) : "";
+    const bounded = this.scenario.mcsrSearch.mode === "bounded";
+    const mcsrKey = bounded
+      ? this.mcsrStateKey()
+      : this.mcsrStateKey(this.mcsrView());
     const mcsrChanged = mcsrKey !== this.committedMcsrKey;
+    const mcsr = mcsrChanged ? this.mcsrView() : this.committedMcsr;
     if (changedLinks.length || routeChanged || analysisChanged || mcsrChanged) {
       this.deltas.push({
         timeUs: this.nowUs,
         stateRevision: ++this.stateRevision,
         version: this.version,
         changedLinks,
-        ...(mcsrChanged && mcsr ? { mcsr } : {}),
+        ...(mcsrChanged && mcsr
+          ? bounded && this.committedMcsr
+            ? { mcsrDelta: diffMcsr(this.committedMcsr, mcsr) }
+            : { mcsr }
+          : {}),
         ...(analysisChanged
           ? { analysis: structuredClone(this.analysis) }
           : {}),
@@ -649,6 +776,7 @@ export class SimulationEngine {
           : {}),
       });
     }
+    this.committedMcsr = mcsr;
     this.committedMcsrKey = mcsrKey;
     this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
     this.committedPath = path;
@@ -666,7 +794,9 @@ export class SimulationEngine {
       version: this.version,
       links: structuredClone([...this.committedLinks.values()]),
       analysis: structuredClone(this.analysis),
-      ...(this.mcsr ? { mcsr: this.mcsrView() } : {}),
+      ...(this.mcsr
+        ? { mcsr: structuredClone(this.committedMcsr ?? this.mcsrView()) }
+        : {}),
       path: [...this.installed],
       pathValid: this.validPath(),
     };
@@ -689,6 +819,7 @@ export class SimulationEngine {
   }
   private changePhysical(id: string, up: boolean) {
     if (this.physical.has(id) === up) return;
+    this.serviceDirty = true;
     if (up) {
       this.physical.add(id);
       this.metrics.linkUp(this.nowUs, id);
@@ -723,6 +854,7 @@ export class SimulationEngine {
         if (misses >= 3) {
           if (this.known.has(id)) {
             this.detectedLinks.add(id);
+            this.serviceDirty = true;
             this.metrics.detected(this.nowUs, id);
             this.notifyLink(id, false, token);
           }
@@ -792,32 +924,63 @@ export class SimulationEngine {
     };
   }
   private observedGraph(): RoutingGraph {
-    const p = positions(
-      this.scenario.config,
-      // MCSR advertisements sample geometry on the same one-second grid as visibility.
-      this.mcsr ? Math.floor(this.nowUs / SECOND) : this.nowUs / SECOND,
-      this.scenario.epochMs,
-    );
+    const interval =
+      this.scenario.mcsrSearch.mode === "bounded"
+        ? this.scenario.mcsrSearch.delayPublishIntervalUs
+        : SECOND;
+    // Attribute notifications must not reveal geometry newer than the observation epoch.
+    const seconds = this.mcsr
+      ? (Math.floor(this.nowUs / interval) * interval) / SECOND
+      : this.nowUs / SECOND;
+    const p = positions(this.scenario.config, seconds, this.scenario.epochMs);
     return {
       nodeCount: p.length,
       links: this.edges.map(([a, b]) => this.networkLink(a, b, p)),
     };
   }
   graph(): RoutingGraph {
-    return this.mcsr?.graph() ?? this.observedGraph();
+    return structuredClone(this.routingGraph());
+  }
+  private routingGraph(): RoutingGraph {
+    return this.mcsr?.graph(undefined, false) ?? this.observedGraph();
+  }
+  private mcsrStateKey(view?: McsrView) {
+    if (!this.mcsr) return "";
+    if (this.scenario.mcsrSearch.mode === "reference")
+      return JSON.stringify(view ?? this.mcsrView());
+    return `${this.mcsr.viewRevision}:${this.control?.displayRevision ?? 0}:${Math.floor(this.nowUs / 100000)}`;
   }
   private mcsrView(): McsrView | undefined {
     return this.mcsr
       ? {
-          ...this.mcsr.view(),
-          ...(this.control ? { control: this.control.view() } : {}),
+          ...this.mcsr.view(false),
+          ...(this.control ? { control: this.control.view(false) } : {}),
         }
       : undefined;
   }
-  private updateMcsr(reason: string) {
+  private metricCommitUs = -1;
+  private updateMcsr(reason: string, coalesced = false) {
+    if (this.scenario.mcsrSearch.mode === "bounded") {
+      if (
+        reason === "geometry-metrics" &&
+        this.nowUs % this.scenario.mcsrSearch.delayPublishIntervalUs !== 0
+      )
+        return;
+      const interval = this.scenario.mcsrSearch.metricCoalesceUs;
+      if (reason === "metrics" && !coalesced && interval) {
+        const atUs = Math.ceil(this.nowUs / interval) * interval;
+        if (this.metricCommitUs !== atUs) {
+          this.metricCommitUs = atUs;
+          this.schedule(atUs, 2.25, () => this.updateMcsr(reason, true));
+        }
+        return;
+      }
+    }
     const controller = this.mcsr!;
     const before = controller.inputKey();
     const updates = controller.update(this.observedGraph(), this.nowUs);
+    if (updates.some((ad) => ad.domainId === controller.sourceDomain))
+      this.serviceDirty = true;
     if (before !== controller.inputKey()) this.inputsChanged(reason);
     for (const ad of updates) {
       this.metrics.record({
@@ -846,6 +1009,8 @@ export class SimulationEngine {
           () => {
             const previous = controller.inputKey();
             const accepted = controller.receive(ad, domain.id, this.nowUs);
+            if (accepted && domain.id === controller.sourceDomain)
+              this.serviceDirty = true;
             this.metrics.record({
               atUs: this.nowUs,
               type: accepted ? "csib-received" : "csib-discarded",
@@ -868,20 +1033,43 @@ export class SimulationEngine {
       candidate: this.validPath() ? evaluatePath(this.installed, links) : null,
     };
   }
-  private calculate() {
-    const graph = this.graph();
-    const started = performance.now();
+  private *calculateSteps() {
+    const graph = this.routingGraph();
+    let started = performance.now(),
+      activeMs = 0;
     let candidates: PathCandidate[];
     let search: DominantSearchSummary | undefined;
     try {
-      const raw = this.strategy.calculate(
-        structuredClone(graph),
-        this.scenario.source,
-        this.scenario.target,
-        (summary) => {
-          search = structuredClone(summary);
-        },
-      );
+      let raw: PathCandidate[];
+      if (
+        this.builtinMcsr &&
+        this.mcsr &&
+        this.scenario.mcsrSearch.mode === "bounded"
+      ) {
+        const job = this.mcsr.calculateSteps(
+          this.scenario.source,
+          this.scenario.target,
+          (summary) => {
+            search = structuredClone(summary);
+          },
+        );
+        let step = job.next();
+        while (!step.done) {
+          activeMs += performance.now() - started;
+          yield;
+          started = performance.now();
+          step = job.next();
+        }
+        raw = step.value;
+      } else
+        raw = this.strategy.calculate(
+          structuredClone(graph),
+          this.scenario.source,
+          this.scenario.target,
+          (summary) => {
+            search = structuredClone(summary);
+          },
+        );
       if (search && !search.complete)
         throw new Error("완료되지 않은 경로 탐색 결과입니다.");
       candidates = validateCandidates(
@@ -920,7 +1108,7 @@ export class SimulationEngine {
     }
     this.profiling.push({
       atUs: this.nowUs,
-      wallMs: performance.now() - started,
+      wallMs: activeMs + performance.now() - started,
     });
     const evaluation = {
       evaluatedUs: this.nowUs,
@@ -989,22 +1177,34 @@ export class SimulationEngine {
     if (this.analysis.id === id) this.analysis.status = status;
   }
   private inputsChanged(reason: string) {
+    this.serviceDirty = true;
     this.inputRevision++;
     this.routingReasons.add(reason);
-    if (this.requestAtUs === this.nowUs) return;
-    this.requestAtUs = this.nowUs;
-    this.schedule(this.nowUs, 2.5, () => {
+    const interval =
+      this.scenario.mcsrSearch.mode === "bounded" &&
+      !["link-down", "link-up"].includes(reason)
+        ? this.scenario.mcsrSearch.metricCoalesceUs
+        : 0;
+    const atUs = interval
+      ? Math.ceil(this.nowUs / interval) * interval
+      : this.nowUs;
+    // A previously queued later batch becomes a no-op if an urgent link change arrives first.
+    if (this.requestAtUs >= this.nowUs && this.requestAtUs <= atUs) return;
+    this.requestAtUs = atUs;
+    this.schedule(atUs, 2.5, () => {
+      if (this.requestAtUs !== atUs) return;
+      this.requestAtUs = -1;
       const trigger = [...this.routingReasons].sort().join(",");
       this.routingReasons.clear();
-      this.requestRoute(trigger);
+      this.pendingJob = this.requestRoute(trigger);
     });
   }
-  private requestRoute(trigger: string) {
+  private *requestRoute(trigger: string): Generator<void, void> {
     if (this.requestedVersion === this.inputRevision) return;
     this.requestedVersion = this.inputRevision;
     const revision = this.inputRevision,
       version = this.version;
-    const graph = this.graph();
+    const graph = this.routingGraph();
     let evaluation: {
       evaluatedUs: number;
       candidates: PathCandidate[];
@@ -1024,8 +1224,8 @@ export class SimulationEngine {
       ) {
         mode = "reserve";
         evaluation = { evaluatedUs: this.nowUs, candidates: available };
-      } else evaluation = this.calculate();
-    } else evaluation = this.calculate();
+      } else evaluation = yield* this.calculateSteps();
+    } else evaluation = yield* this.calculateSteps();
     const selected = this.decide(
       evaluation.candidates,
       mode,
@@ -1104,9 +1304,14 @@ export class SimulationEngine {
           return;
         }
         this.decisionStatus(decisionId, "installed");
+        const wasAvailable = this.validPath();
         this.installed = [...path];
-        this.routeInstalledAtUs = this.nowUs;
-        this.routeInstalledMode = mode;
+        this.installedKey = this.installed.join(":");
+        this.serviceDirty = true;
+        if (!wasAvailable && this.validPath()) {
+          this.routeRestoredAtUs = this.nowUs;
+          this.routeRestoredMode = mode;
+        }
         this.installedEvaluation = {
           evaluatedUs: evaluation.evaluatedUs,
           candidate: structuredClone(selected),
@@ -1130,40 +1335,59 @@ export class SimulationEngine {
       throw new Error("사건 처리 묶음은 1 이상이어야 합니다.");
     let processed = 0;
     while (
-      this.queue.peek() &&
-      this.queue.peek().atUs <= targetUs &&
-      processed < budget
+      this.pendingJob ||
+      this.instantOpen ||
+      (this.queue.peek() &&
+        this.queue.peek().atUs <= targetUs &&
+        processed < budget)
     ) {
-      this.nowUs = this.queue.peek().atUs;
-      do {
-        const event = this.queue.pop();
-        try {
-          event.run();
-        } catch (error) {
-          if (!this.failure) {
-            this.failure = {
-              atUs: this.nowUs,
-              code:
-                error instanceof DominantSearchError ||
-                error instanceof ControlTransportError
-                  ? error.code
-                  : "simulation-failed",
-              message: error instanceof Error ? error.message : String(error),
-              ...(error instanceof DominantSearchError
-                ? { search: structuredClone(error.search) }
-                : {}),
-            };
-            this.metrics.record({
-              atUs: this.nowUs,
-              type: "simulation-failed",
-              reason: this.failure.code,
-            });
+      try {
+        if (this.pendingJob) {
+          const step = this.pendingJob.next();
+          if (!step.done) {
+            if (Number.isFinite(budget)) return false;
+            continue;
           }
-          throw error;
+          this.pendingJob = undefined;
+          continue;
         }
-        processed++;
-      } while (this.queue.peek() && this.queue.peek().atUs === this.nowUs);
-      this.commitInstant();
+        if (this.instantOpen) {
+          if (this.queue.peek()?.atUs === this.nowUs) {
+            if (processed >= budget) return false;
+            this.queue.pop().run();
+            processed++;
+            continue;
+          }
+          this.commitInstant();
+          this.instantOpen = false;
+          continue;
+        }
+        this.nowUs = this.queue.peek().atUs;
+        this.instantOpen = true;
+      } catch (error) {
+        this.pendingJob = undefined;
+        this.instantOpen = false;
+        if (!this.failure) {
+          this.failure = {
+            atUs: this.nowUs,
+            code:
+              error instanceof DominantSearchError ||
+              error instanceof ControlTransportError
+                ? error.code
+                : "simulation-failed",
+            message: error instanceof Error ? error.message : String(error),
+            ...(error instanceof DominantSearchError
+              ? { search: structuredClone(error.search) }
+              : {}),
+          };
+          this.metrics.record({
+            atUs: this.nowUs,
+            type: "simulation-failed",
+            reason: this.failure.code,
+          });
+        }
+        throw error;
+      }
     }
     const done = !this.queue.peek() || this.queue.peek().atUs > targetUs;
     if (done) this.nowUs = targetUs;
@@ -1190,7 +1414,7 @@ export class SimulationEngine {
       pathValid: this.validPath(),
       length: pathLength(this.installed, p),
       routingAlgorithm: this.strategy.name,
-      mcsr: this.mcsrView(),
+      mcsr: structuredClone(this.mcsrView()),
       routingAnalysis: structuredClone(this.analysis),
       currentPathMetrics: this.currentPathMetrics(p),
       routingStages: this.metrics.events
@@ -1216,6 +1440,8 @@ export class SimulationEngine {
     };
   }
   result() {
+    if (this.needsWork)
+      throw new Error("현재 논리 시각의 계산이 완료되지 않았습니다.");
     return {
       modelVersion: MODEL_VERSION,
       routingAlgorithm: this.strategy.name,

@@ -101,6 +101,17 @@ export function fixed(v: Vec3, a: number): Vec3 {
     z: v.z,
   };
 }
+export function position(
+  c: Config,
+  id: number,
+  seconds: number,
+  startMs: number,
+): Vec3 {
+  return fixed(
+    inertial(c, Math.floor(id / c.perPlane), id % c.perPlane, seconds),
+    gmst(startMs + seconds * 1000),
+  );
+}
 export function positions(c: Config, seconds: number, startMs: number): Vec3[] {
   const a = gmst(startMs + seconds * 1000);
   return Array.from({ length: c.planes * c.perPlane }, (_, id) =>
@@ -124,7 +135,7 @@ export function visible(a: Vec3, b: Vec3) {
     Math.hypot(a.x + t * dx, a.y + t * dy, a.z + t * dz) > EARTH_RADIUS + 1000
   );
 }
-// shortcut: fixed logical mesh for flow demos; replace with paper handover rules before MCSR evaluation.
+// shortcut: fixed mesh with Earth occlusion; dynamic ISL handover requires a separate topology model.
 export function mesh(c: Config): [number, number][] {
   const edges: [number, number][] = [],
     seen = new Set<string>();

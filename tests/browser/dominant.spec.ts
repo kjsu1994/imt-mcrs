@@ -58,7 +58,7 @@ test("automatic frontier, service choice, cached recovery and result replay agre
   const data = JSON.parse(
     await readFile((await (await pending).path())!, "utf8"),
   );
-  expect(data.scenario.schemaVersion).toBe(7);
+  expect(data.scenario.schemaVersion).toBe(8);
   expect(data.scenario.routing.algorithm).toBe("dominant-paths");
   expect(data.result.validForAnalysis).toBe(true);
   expect(data.result.routingEvaluations).toHaveLength(3);

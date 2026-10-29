@@ -37,7 +37,9 @@ export function useSimulation(
     setFailed(false);
     w.onmessage = ({ data }: MessageEvent<Reply>) => {
       if (!active || data.runId !== id.current) return;
-      if (data.type === "error") {
+      if (data.type === "busy") {
+        setState((s) => (s?.owner === scenario ? { ...s, busy: true } : s));
+      } else if (data.type === "error") {
         setError(data.message);
         if (data.fatal) setFailed(true);
       } else if (data.type === "state") {
@@ -62,6 +64,7 @@ export function useSimulation(
             owner: scenario,
             frame: {
               ...data.progress,
+              mcsr: stream.latestMcsr,
               ...histories,
               scenario: currentScenario,
             },
@@ -86,9 +89,18 @@ export function useSimulation(
         }
       } else {
         const url = URL.createObjectURL(
-            new Blob([JSON.stringify(data.data, null, 2)], {
-              type: "application/json",
-            }),
+            new Blob(
+              [
+                JSON.stringify(
+                  data.data,
+                  null,
+                  data.what === "scenario" ? 2 : undefined,
+                ),
+              ],
+              {
+                type: "application/json",
+              },
+            ),
           ),
           a = document.createElement("a");
         a.href = url;

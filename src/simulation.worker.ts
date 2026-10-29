@@ -15,15 +15,33 @@ let engine: SimulationEngine | null = null,
   lastCheckpoint = -Infinity,
   lastMetrics = -1,
   lastFailureCount = -1,
-  lastCompleted = false;
+  lastCompleted = false,
+  pendingReset = false,
+  pendingVerify = false,
+  busyReported = false;
+const exportsPending: ("scenario" | "result")[] = [];
 function anchor() {
   anchorWall = performance.now();
   anchorUs = engine?.nowUs ?? 0;
 }
 function send(reset = false, verify = false) {
   if (!engine) return;
+  if (engine.needsWork) {
+    pendingReset ||= reset;
+    pendingVerify ||= verify;
+    if (!busyReported) {
+      port.postMessage({ type: "busy", runId });
+      busyReported = true;
+    }
+    return;
+  }
+  busyReported = false;
+  reset ||= pendingReset;
+  verify ||= pendingVerify;
+  pendingReset = false;
+  pendingVerify = false;
   const now = performance.now();
-  const { serviceOutages, linkFailures, ...progress } = engine.progress();
+  const { serviceOutages, linkFailures, mcsr, ...progress } = engine.progress();
   const completed =
     !engine.failure && engine.nowUs === engine.scenario.durationUs;
   const checkpoint =
@@ -75,7 +93,11 @@ port.onmessage = ({ data: c }) => {
     if (c.type === "load") {
       runId = c.runId;
       engine = null;
-      const next = new SimulationEngine(c.scenario);
+      exportsPending.length = 0;
+      pendingReset = true;
+      pendingVerify = false;
+      busyReported = false;
+      const next = new SimulationEngine(c.scenario, undefined, true);
       engine = next;
       playing = c.playing;
       speed = c.speed;
@@ -106,7 +128,10 @@ port.onmessage = ({ data: c }) => {
         const scenario = engine.scenario;
         runId = c.nextRunId;
         engine = null;
-        engine = new SimulationEngine(scenario);
+        exportsPending.length = 0;
+        pendingReset = true;
+        pendingVerify = false;
+        engine = new SimulationEngine(scenario, undefined, true);
         target = c.atUs;
         anchor();
         send(true);
@@ -117,7 +142,7 @@ port.onmessage = ({ data: c }) => {
       case "step":
         playing = false;
         target = null;
-        engine.step();
+        target = engine.nextEventUs();
         anchor();
         send(true);
         break;
@@ -128,7 +153,7 @@ port.onmessage = ({ data: c }) => {
         };
         engine.addFailure(event);
         if (c.immediate) {
-          engine.advanceTo(event.atUs);
+          target = event.atUs;
           anchor();
         }
         send();
@@ -140,25 +165,31 @@ port.onmessage = ({ data: c }) => {
         send();
         break;
       case "export":
-        port.postMessage({
-          type: "export",
-          runId,
-          what: c.what,
-          data:
-            c.what === "scenario"
-              ? structuredClone(engine.scenario)
-              : {
-                  scenario: structuredClone(engine.scenario),
-                  result: engine.result(),
-                  profiling: structuredClone(engine.profiling),
-                },
-        });
+        exportsPending.push(c.what);
         break;
     }
   } catch (error) {
     fail(error, c.type === "load" || c.type === "seek" || !!engine?.failure);
   }
 };
+function exportReady() {
+  if (!engine || engine.needsWork) return;
+  for (const what of exportsPending.splice(0)) {
+    port.postMessage({
+      type: "export",
+      runId,
+      what: what,
+      data:
+        what === "scenario"
+          ? structuredClone(engine.scenario)
+          : {
+              scenario: structuredClone(engine.scenario),
+              result: engine.result(),
+              profiling: structuredClone(engine.profiling),
+            },
+    });
+  }
+}
 function pump() {
   try {
     if (engine) {
@@ -172,7 +203,7 @@ function pump() {
                 Math.max(0, Math.floor((now - anchorWall) * 1000 * speed)),
             )
           : engine.nowUs);
-      if (target !== null || playing) {
+      if (target !== null || playing || engine.needsWork) {
         const done = engine.advanceTo(Math.max(engine.nowUs, until), 500);
         if (done && target !== null) {
           target = null;
@@ -184,8 +215,9 @@ function pump() {
           anchor();
           send(false, true);
         }
-        if (now - lastSent >= 100) send();
+        if (now - lastSent >= 100 || busyReported) send();
       }
+      exportReady();
     }
   } catch (error) {
     fail(error);

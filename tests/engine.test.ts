@@ -254,14 +254,14 @@ test("geometry and forced restoration at 106 seconds commit one physical state",
 });
 test("legacy scenarios retain parameters and reject unsupported versions and UTC overflow", () => {
   const { schemaVersion, ...legacy } = scenario();
-  assert.equal(normalizeScenario(legacy).schemaVersion, 7);
+  assert.equal(normalizeScenario(legacy).schemaVersion, 8);
   assert.equal(normalizeScenario(legacy).epochMs, legacy.epochMs);
   const a = new SimulationEngine(legacy),
     b = new SimulationEngine({ ...legacy, schemaVersion: 2 });
   a.advanceTo(legacy.durationUs);
   b.advanceTo(legacy.durationUs);
   assert.deepEqual(a.result(), b.result());
-  assert.equal(a.result().modelVersion, "mcsr-control-v7");
+  assert.equal(a.result().modelVersion, "mcsr-scale-v8");
   assert.throws(() => normalizeScenario({ ...legacy, schemaVersion: 99 }));
   assert.throws(() =>
     normalizeScenario({ ...legacy, epochMs: 8640000000000000 }),
@@ -318,4 +318,35 @@ test("one path link restoring while another fails at the same instant cannot end
   assert.equal(e.result().serviceOutages[0].recoveredUs, null);
   assert.deepEqual(e.result().serviceOutages[0].causeLinkIds, ["0:1", "1:2"]);
   assert.ok(!e.result().events.some((x) => x.type === "service-restored"));
+});
+
+test("reinstalling the original path after an empty route is algorithmic recovery", () => {
+  const s = scenario();
+  s.failures = [
+    { atUs: SECOND, linkId: "0:1", down: true },
+    { atUs: SECOND, linkId: "0:7", down: true },
+    { atUs: 2 * SECOND, linkId: "0:1", down: false },
+    { atUs: 2 * SECOND, linkId: "0:7", down: false },
+  ];
+  const e = new SimulationEngine(s);
+  e.advanceTo(s.durationUs);
+  const outage = e.result().serviceOutages[0];
+  assert.deepEqual(outage.previousPath, outage.restoredPath);
+  assert.equal(outage.recoveryMechanism, "recalculate");
+  assert.equal(outage.recoveredUs, 2002000);
+});
+test("physical restoration before a same-time replacement install remains physical recovery", () => {
+  const s = scenario();
+  s.computeDelayUs = 50000;
+  s.installDelayUs = 0;
+  s.failures = [
+    { atUs: SECOND, linkId: "0:1", down: true },
+    { atUs: 1250000, linkId: "0:1", down: false },
+  ];
+  const e = new SimulationEngine(s);
+  e.advanceTo(s.durationUs);
+  const outage = e.result().serviceOutages[0];
+  assert.notDeepEqual(outage.previousPath, outage.restoredPath);
+  assert.equal(outage.recoveredUs, 1250000);
+  assert.equal(outage.recoveryMechanism, "physical-restoration");
 });

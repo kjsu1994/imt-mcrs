@@ -31,3 +31,5 @@ Desktop.ini
 
 # Local reference papers (keep application assets tracked)
 /*.pdf
+
+artifacts/

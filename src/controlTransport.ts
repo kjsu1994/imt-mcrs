@@ -1,4 +1,6 @@
-import { route } from "./model";
+import { makeCsibDelta } from "./csibDelta";
+import type { CsibDelta } from "./csibDelta";
+
 import type { RoutingGraph } from "./routing";
 import type { DomainAdvertisement } from "./mcsr";
 
@@ -17,7 +19,8 @@ export type ControlEvent = {
     | "expired"
     | "timeout"
     | "acknowledged"
-    | "ack-ignored";
+    | "ack-ignored"
+    | "resync-requested";
   messageId: number;
   kind: "update" | "ack";
   origin: number;
@@ -42,6 +45,16 @@ export type ControlFlight = {
   expiresUs: number;
 };
 export type ControlView = {
+  payloadStats?: {
+    deltas: number;
+    checkpoints: number;
+    resyncRequests: number;
+  };
+  pendingTotal?: number;
+  flightsTotal?: number;
+  traceOmitted?: number;
+  flightOmitted?: number;
+  focusDomain?: number;
   pending: {
     origin: number;
     recipient: number;
@@ -69,11 +82,14 @@ export interface ControlEnvironment {
   nowUs(): number;
   schedule(atUs: number, priority: number, run: () => void): void;
   graph(domainId: number): RoutingGraph;
+  availabilityKey?(domainId: number): string;
   physical(
     a: number,
     b: number,
   ): { available: boolean; token: number; delayUs: number };
   receive(ad: DomainAdvertisement, recipient: number): boolean;
+  receiveDelta?(delta: CsibDelta, recipient: number): boolean | null;
+  initialAdvertisement?(domainId: number): DomainAdvertisement;
 }
 export class ControlTransportError extends Error {
   readonly code = "control-event-limit";
@@ -84,13 +100,22 @@ type Pending = {
   attempt: number;
   messageId: number;
   expiresUs: number;
+  forceCheckpoint?: boolean;
 };
 // shortcut: atomic control messages omit serialization and queue contention; add those only for packet-level experiments.
 export class ControlTransport {
   readonly events: ControlEvent[] = [];
+  private acknowledgedAds = new Map<string, DomainAdvertisement>();
+  private payloadStats = { deltas: 0, checkpoints: 0, resyncRequests: 0 };
+  private focusedPending = new Set<string>();
+  private focusedFlights = new Set<number>();
   private pending = new Map<string, Pending>();
   private flights = new Map<number, ControlFlight>();
   private sequence = 0;
+  displayRevision = 0;
+  traceOmitted = 0;
+  private recent: ControlEvent[] = [];
+  private trees = new Map<number, { signature: string; parents: Int32Array }>();
   private stats: ControlView["stats"] = {
     sentUpdates: 0,
     sentAcks: 0,
@@ -108,6 +133,11 @@ export class ControlTransport {
     private processingUs: number,
     private timeoutUs: number,
     private env: ControlEnvironment,
+    private limits?: {
+      eventLimit: number;
+      traceLimit: number;
+      focusDomain: number;
+    },
   ) {
     if (
       !ds.length ||
@@ -136,15 +166,23 @@ export class ControlTransport {
         expiresUs: 0,
       };
       this.pending.set(key, p);
+      if (
+        this.limits &&
+        (ad.domainId === this.limits.focusDomain ||
+          recipient === this.limits.focusDomain)
+      )
+        this.focusedPending.add(key);
       this.attempt(p);
     }
   }
   private emit(type: ControlEvent["type"], f: ControlFlight, reason?: string) {
-    if (this.events.length >= CONTROL_EVENT_LIMIT)
+    if (
+      this.stats.eventCount >= (this.limits?.eventLimit ?? CONTROL_EVENT_LIMIT)
+    )
       throw new ControlTransportError(
-        "제어 사건 한도(100,000건)를 초과했습니다.",
+        `제어 사건 한도(${(this.limits?.eventLimit ?? CONTROL_EVENT_LIMIT).toLocaleString("en-US")}건)를 초과했습니다.`,
       );
-    this.events.push({
+    const event: ControlEvent = {
       atUs: this.env.nowUs(),
       type,
       messageId: f.messageId,
@@ -156,13 +194,44 @@ export class ControlTransport {
       path: [...f.path],
       hop: f.hop,
       ...(reason ? { reason } : {}),
-    });
+    };
+    this.events.push(event);
+    if (this.limits && this.events.length > this.limits.traceLimit) {
+      const removed = Math.max(1, Math.floor(this.limits.traceLimit / 10));
+      this.events.splice(0, removed);
+      this.traceOmitted += removed;
+    }
+    if (
+      !this.limits ||
+      f.origin === this.limits.focusDomain ||
+      f.recipient === this.limits.focusDomain
+    ) {
+      this.displayRevision++;
+      this.recent.push(event);
+      if (this.recent.length > 24) this.recent.shift();
+    }
     this.stats.eventCount++;
   }
   private attempt(p: Pending) {
     if (p.attempt) this.stats.retries++;
     p.attempt++;
     p.expiresUs = this.env.nowUs() + this.timeoutUs;
+    const baseline =
+      this.acknowledgedAds.get(this.key(p.ad.domainId, p.recipient)) ??
+      this.env.initialAdvertisement?.(p.ad.domainId);
+    const delta =
+      this.limits &&
+      this.env.receiveDelta &&
+      baseline?.links &&
+      p.ad.links &&
+      baseline.revision < p.ad.revision &&
+      !p.forceCheckpoint
+        ? makeCsibDelta(baseline, p.ad)
+        : undefined;
+    if (this.limits) {
+      if (delta) this.payloadStats.deltas++;
+      else this.payloadStats.checkpoints++;
+    }
     const f = this.send(
       "update",
       p.ad.domainId,
@@ -172,9 +241,17 @@ export class ControlTransport {
       p.expiresUs,
       () => {
         this.stats.deliveredUpdates++;
-        const applied = this.env.receive(p.ad, p.recipient);
+        const applied = delta
+          ? this.env.receiveDelta!(delta, p.recipient)
+          : this.env.receive(p.ad, p.recipient);
+        const resync = applied === null;
+        if (resync) this.payloadStats.resyncRequests++;
         if (applied) this.stats.appliedUpdates++;
-        this.emit(applied ? "applied" : "duplicate", f);
+        this.emit(
+          resync ? "resync-requested" : applied ? "applied" : "duplicate",
+          f,
+          resync ? "csib-base-mismatch" : undefined,
+        );
         const ack = this.send(
           "ack",
           p.recipient,
@@ -188,7 +265,17 @@ export class ControlTransport {
               this.key(p.ad.domainId, p.recipient),
             );
             if (current === p && current.messageId === f.messageId) {
+              if (resync) {
+                p.forceCheckpoint = true;
+                this.attempt(p);
+                return;
+              }
+              this.acknowledgedAds.set(
+                this.key(p.ad.domainId, p.recipient),
+                p.ad,
+              );
               this.pending.delete(this.key(p.ad.domainId, p.recipient));
+              this.focusedPending.delete(this.key(p.ad.domainId, p.recipient));
               this.stats.acknowledged++;
               this.emit("acknowledged", ack);
             } else this.emit("ack-ignored", ack, "superseded-attempt");
@@ -230,6 +317,12 @@ export class ControlTransport {
       arrivesUs: this.env.nowUs() + this.processingUs,
     };
     this.flights.set(f.messageId, f);
+    if (
+      this.limits &&
+      (origin === this.limits.focusDomain ||
+        recipient === this.limits.focusDomain)
+    )
+      this.focusedFlights.add(f.messageId);
     if (kind === "update") this.stats.sentUpdates++;
     else this.stats.sentAcks++;
     this.emit("sent", f);
@@ -240,14 +333,7 @@ export class ControlTransport {
       if (!this.flights.has(f.messageId) || this.env.nowUs() > expiresUs)
         return;
       const graph = this.env.graph(origin);
-      f.path = route(
-        graph.nodeCount,
-        graph.links
-          .filter((l) => l.knownAvailable)
-          .map((l) => [l.sourceId, l.targetId]),
-        this.ds[origin],
-        this.ds[recipient],
-      );
+      f.path = this.path(graph, origin, this.ds[recipient]);
       if (!f.path.length) {
         this.drop(f, "no-known-route");
         return;
@@ -256,8 +342,45 @@ export class ControlTransport {
     });
     return f;
   }
+  private path(graph: RoutingGraph, origin: number, target: number) {
+    const signature =
+      this.env.availabilityKey?.(origin) ??
+      graph.links
+        .filter((l) => l.knownAvailable)
+        .map((l) => l.id)
+        .join("|");
+    let tree = this.trees.get(origin);
+    if (!tree || tree.signature !== signature) {
+      const adjacency: number[][] = Array.from(
+        { length: graph.nodeCount },
+        () => [],
+      );
+      for (const l of graph.links)
+        if (l.knownAvailable) {
+          adjacency[l.sourceId].push(l.targetId);
+          adjacency[l.targetId].push(l.sourceId);
+        }
+      const parents = new Int32Array(graph.nodeCount).fill(-1),
+        queue = [this.ds[origin]];
+      parents[queue[0]] = queue[0];
+      for (let i = 0; i < queue.length; i++)
+        for (const n of adjacency[queue[i]])
+          if (parents[n] === -1) {
+            parents[n] = queue[i];
+            queue.push(n);
+          }
+      tree = { signature, parents };
+      this.trees.set(origin, tree);
+    }
+    if (tree.parents[target] === -1) return [];
+    const path = [target];
+    while (path.at(-1)! !== this.ds[origin])
+      path.push(tree.parents[path.at(-1)!]);
+    return path.reverse();
+  }
   private drop(f: ControlFlight, reason: string) {
     this.flights.delete(f.messageId);
+    this.focusedFlights.delete(f.messageId);
     this.stats.dropped++;
     if (reason === "expired") this.stats.expired++;
     this.emit(reason === "expired" ? "expired" : "dropped", f, reason);
@@ -270,6 +393,7 @@ export class ControlTransport {
     }
     if (f.hop === f.path.length - 1) {
       this.flights.delete(f.messageId);
+      this.focusedFlights.delete(f.messageId);
       this.emit("delivered", f);
       delivered();
       return;
@@ -299,9 +423,25 @@ export class ControlTransport {
       this.hop(f, delivered);
     });
   }
-  view(): ControlView {
-    return {
-      pending: [...this.pending.values()].map((p) => ({
+  view(copy = true): ControlView {
+    const pending = this.limits
+      ? [...this.focusedPending].map((key) => this.pending.get(key)!)
+      : [...this.pending.values()];
+    const flights = this.limits
+      ? [...this.focusedFlights].map((id) => this.flights.get(id)!)
+      : [...this.flights.values()];
+    const result = {
+      ...(this.limits
+        ? {
+            payloadStats: { ...this.payloadStats },
+            pendingTotal: this.pending.size,
+            flightsTotal: this.flights.size,
+            traceOmitted: this.traceOmitted,
+            flightOmitted: Math.max(0, flights.length - 256),
+            focusDomain: this.limits.focusDomain,
+          }
+        : {}),
+      pending: pending.map((p) => ({
         origin: p.ad.domainId,
         recipient: p.recipient,
         revision: p.ad.revision,
@@ -309,12 +449,32 @@ export class ControlTransport {
         messageId: p.messageId,
         expiresUs: p.expiresUs,
       })),
-      flights: structuredClone([...this.flights.values()]),
-      events: structuredClone(this.events.slice(-24)),
+      flights: (this.limits ? flights.slice(-256) : flights).map((f) => ({
+        ...f,
+      })),
+      events: [...this.recent],
       stats: { ...this.stats },
     };
+    return copy ? structuredClone(result) : result;
   }
   exportState() {
-    return { ...this.view(), events: structuredClone(this.events) };
+    return {
+      ...this.view(),
+      events: structuredClone(this.events),
+      ...(this.limits
+        ? {
+            traceOmitted: this.traceOmitted,
+            flightsAll: structuredClone([...this.flights.values()]),
+            pendingAll: [...this.pending.values()].map((p) => ({
+              origin: p.ad.domainId,
+              recipient: p.recipient,
+              revision: p.ad.revision,
+              attempt: p.attempt,
+              messageId: p.messageId,
+              expiresUs: p.expiresUs,
+            })),
+          }
+        : {}),
+    };
   }
 }

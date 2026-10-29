@@ -287,6 +287,14 @@ export const DOMINANT_EXPANSION_LIMIT = 100000;
 export const DOMINANT_CANDIDATE_LIMIT = 2048;
 export interface DominantSearchSummary {
   complete: boolean;
+  coverage?: "bounded";
+  boundedPruned?: number;
+  localExpandedStates?: number;
+  localBoundedPruned?: number;
+  limitedSamples?: {
+    nodes: number[];
+    reason: "label-limit" | "end-candidate-limit";
+  }[];
   expandedStates: number;
   completedPaths: number;
   frontierSize: number;
@@ -296,13 +304,87 @@ export interface DominantSearchSummary {
 export class DominantSearchError extends Error {
   constructor(
     public readonly code:
-      "node-limit" | "expansion-limit" | "candidate-limit" | "invalid-graph",
+      | "node-limit"
+      | "expansion-limit"
+      | "candidate-limit"
+      | "invalid-graph"
+      | "bounded-no-candidate",
     message: string,
     public readonly search: DominantSearchSummary,
   ) {
     super(message);
     this.name = "DominantSearchError";
   }
+}
+export function validateRoutingGraph(
+  graph: RoutingGraph,
+  source: number,
+  target: number,
+) {
+  const abort = (_code: "invalid-graph", message: string): never => {
+    throw new DominantSearchError("invalid-graph", message, {
+      complete: false,
+      expandedStates: 0,
+      completedPaths: 0,
+      frontierSize: 0,
+      removedPaths: 0,
+      prunedSamples: [],
+    });
+  };
+  if (!Number.isInteger(graph.nodeCount) || graph.nodeCount < 1)
+    abort("invalid-graph", "잘못된 그래프 노드 수입니다.");
+  if (
+    !Number.isInteger(source) ||
+    !Number.isInteger(target) ||
+    source < 0 ||
+    target < 0 ||
+    source >= graph.nodeCount ||
+    target >= graph.nodeCount
+  )
+    abort("invalid-graph", "출발·도착 노드 범위가 잘못되었습니다.");
+  const adjacent: { node: number; metrics: LinkMetrics }[][] = Array.from(
+    { length: graph.nodeCount },
+    () => [],
+  );
+  const seen = new Set<string>(),
+    seenIds = new Set<string>();
+  for (const link of graph.links) {
+    const a = link.sourceId,
+      b = link.targetId,
+      m = link.metrics,
+      key = pairId(a, b);
+    if (
+      !Number.isInteger(a) ||
+      !Number.isInteger(b) ||
+      a < 0 ||
+      b < 0 ||
+      a >= graph.nodeCount ||
+      b >= graph.nodeCount ||
+      a === b ||
+      typeof link.id !== "string" ||
+      !link.id ||
+      seenIds.has(link.id) ||
+      seen.has(key) ||
+      typeof link.knownAvailable !== "boolean" ||
+      !m ||
+      ![m.propagationDelayMs, m.availableBufferRatio, m.jitterMs].every(
+        Number.isFinite,
+      ) ||
+      m.propagationDelayMs < 0 ||
+      m.availableBufferRatio < 0 ||
+      m.availableBufferRatio > 1 ||
+      m.jitterMs < 0
+    )
+      abort("invalid-graph", "잘못되었거나 중복된 그래프 링크입니다.");
+    seen.add(key);
+    seenIds.add(link.id);
+    if (link.knownAvailable) {
+      adjacent[a].push({ node: b, metrics: m });
+      adjacent[b].push({ node: a, metrics: m });
+    }
+  }
+  adjacent.forEach((neighbors) => neighbors.sort((a, b) => a.node - b.node));
+  return adjacent;
 }
 // Reference search for small graphs; no prefix pruning that could discard distinct spare paths.
 export function findDominantPaths(
@@ -324,56 +406,9 @@ export function findDominantPaths(
     summary.frontierSize = frontier.length;
     throw new DominantSearchError(code, message, structuredClone(summary));
   };
-  if (!Number.isInteger(graph.nodeCount) || graph.nodeCount < 1)
-    abort("invalid-graph", "잘못된 그래프 노드 수입니다.");
   if (graph.nodeCount > DOMINANT_NODE_LIMIT)
     abort("node-limit", "자동 우세 경로는 16기 이하에서 지원합니다.");
-  if (
-    !Number.isInteger(source) ||
-    !Number.isInteger(target) ||
-    source < 0 ||
-    target < 0 ||
-    source >= graph.nodeCount ||
-    target >= graph.nodeCount
-  )
-    abort("invalid-graph", "출발·도착 노드 범위가 잘못되었습니다.");
-  const adjacent: { node: number; metrics: LinkMetrics }[][] = Array.from(
-    { length: graph.nodeCount },
-    () => [],
-  );
-  const seen = new Set<string>();
-  for (const link of graph.links) {
-    const a = link.sourceId,
-      b = link.targetId,
-      m = link.metrics,
-      key = pairId(a, b);
-    if (
-      !Number.isInteger(a) ||
-      !Number.isInteger(b) ||
-      a < 0 ||
-      b < 0 ||
-      a >= graph.nodeCount ||
-      b >= graph.nodeCount ||
-      a === b ||
-      seen.has(key) ||
-      typeof link.knownAvailable !== "boolean" ||
-      !m ||
-      ![m.propagationDelayMs, m.availableBufferRatio, m.jitterMs].every(
-        Number.isFinite,
-      ) ||
-      m.propagationDelayMs < 0 ||
-      m.availableBufferRatio < 0 ||
-      m.availableBufferRatio > 1 ||
-      m.jitterMs < 0
-    )
-      abort("invalid-graph", "잘못되었거나 중복된 그래프 링크입니다.");
-    seen.add(key);
-    if (link.knownAvailable) {
-      adjacent[a].push({ node: b, metrics: m });
-      adjacent[b].push({ node: a, metrics: m });
-    }
-  }
-  adjacent.forEach((neighbors) => neighbors.sort((a, b) => a.node - b.node));
+  const adjacent = validateRoutingGraph(graph, source, target);
   const removed = (candidate: PathCandidate, by: PathCandidate) => {
     summary.removedPaths++;
     if (summary.prunedSamples.length < 20)

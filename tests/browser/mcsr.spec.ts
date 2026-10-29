@@ -19,7 +19,7 @@ test("MCSR regions, decisions, delayed CSIB, event seek and exported core replay
   await page.goto("/");
   await expect(page.locator('option[value="mcsr"]')).toHaveJSProperty(
     "disabled",
-    true,
+    false,
   );
   await loadFixed();
   await expect(page.getByLabel("라우팅 알고리즘", { exact: true })).toHaveValue(

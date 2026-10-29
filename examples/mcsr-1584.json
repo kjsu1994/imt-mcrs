@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 8,
+  "mcsrSearch": {
+    "mode": "bounded",
+    "localCandidates": 4,
+    "labelsPerBoundary": 16,
+    "endCandidates": 8,
+    "expansionLimit": 2000000,
+    "delayPublishIntervalUs": 30000000,
+    "metricCoalesceUs": 100000,
+    "traceLimit": 10000,
+    "controlEventLimit": 50000000
+  },
+  "config": {
+    "planes": 72,
+    "perPlane": 22,
+    "altitude": 550,
+    "inclination": 53,
+    "phase": 1
+  },
+  "srd": {
+    "planesPerDomain": 6,
+    "satellitesPerDomain": 4
+  },
+  "controlTransport": {
+    "mode": "isl",
+    "ackTimeoutUs": 1000000
+  },
+  "epochMs": 1767225600000,
+  "durationUs": 600000000,
+  "seed": 1,
+  "source": 0,
+  "target": 1573,
+  "slsIntervalUs": 100000,
+  "computeDelayUs": 1000,
+  "installDelayUs": 1000,
+  "failures": [
+    {
+      "atUs": 20000000,
+      "linkId": "797:819",
+      "down": true
+    },
+    {
+      "atUs": 25000000,
+      "linkId": "797:819",
+      "down": false
+    },
+    {
+      "atUs": 100000000,
+      "linkId": "0:1",
+      "down": true
+    },
+    {
+      "atUs": 110000000,
+      "linkId": "0:1",
+      "down": false
+    },
+    {
+      "atUs": 100000000,
+      "linkId": "0:22",
+      "down": true
+    },
+    {
+      "atUs": 110000000,
+      "linkId": "0:22",
+      "down": false
+    },
+    {
+      "atUs": 100000000,
+      "linkId": "0:21",
+      "down": true
+    },
+    {
+      "atUs": 110000000,
+      "linkId": "0:21",
+      "down": false
+    }
+  ],
+  "linkMetricUpdates": [
+    {
+      "atUs": 0,
+      "linkId": "797:819",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 600,
+      "jitterMs": 20
+    },
+    {
+      "atUs": 60000000,
+      "linkId": "797:819",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 900,
+      "jitterMs": 5
+    },
+    {
+      "atUs": 90000000,
+      "linkId": "797:819",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 100,
+      "jitterMs": 2
+    },
+    {
+      "atUs": 0,
+      "linkId": "786:808",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 600,
+      "jitterMs": 20
+    },
+    {
+      "atUs": 60000000,
+      "linkId": "786:808",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 900,
+      "jitterMs": 5
+    },
+    {
+      "atUs": 90000000,
+      "linkId": "786:808",
+      "bufferCapacityPackets": 1000,
+      "queuedPackets": 100,
+      "jitterMs": 2
+    }
+  ],
+  "routing": {
+    "algorithm": "mcsr",
+    "service": "LS",
+    "candidatePaths": []
+  },
+  "notificationDelayUs": 0,
+  "switchDelayUs": 0
+}

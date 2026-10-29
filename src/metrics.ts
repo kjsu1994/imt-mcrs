@@ -125,8 +125,7 @@ export class MetricsEngine {
     if (available) {
       outage.recoveredUs = atUs;
       outage.recoveryMechanism =
-        (installedMode === "reserve" || installedMode === "recalculate") &&
-        path.join(":") !== outage.previousPath.join(":")
+        installedMode === "reserve" || installedMode === "recalculate"
           ? installedMode
           : "physical-restoration";
       outage.restoredPath = [...path];

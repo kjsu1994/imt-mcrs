@@ -11,7 +11,8 @@
     "test": "tsx --test tests/*.test.ts",
     "test:browser": "playwright test",
     "simulate": "tsx scripts/run-scenario.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "benchmark:mcsr": "tsx scripts/benchmark-mcsr.ts"
   },
   "dependencies": {
     "cesium": "1.146.0",
