@@ -1,3 +1,5 @@
+import { GroundAccess, GroundMetrics, validateGround } from "./ground";
+import type { GroundSettings, GroundView } from "./ground";
 import { diffMcsr } from "./mcsrStream";
 import type { McsrDelta } from "./mcsrStream";
 import { searchDefaults, runSearch } from "./boundedSearch";
@@ -40,11 +42,12 @@ import type {
 } from "./routing";
 export const SECOND = 1000000;
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 0, 1);
-export const MODEL_VERSION = "mcsr-scale-v8";
+export const MODEL_VERSION = "mcsr-ground-v9";
 export type FailureEvent = { atUs: number; linkId: string; down: boolean };
 export type LinkMetricUpdate = LinkLoad & { atUs: number; linkId: string };
 export type Scenario = {
-  schemaVersion: 8;
+  schemaVersion: 9;
+  ground: GroundSettings | null;
   mcsrSearch: McsrSearchSettings;
   config: Config;
   srd: SrdSettings;
@@ -80,7 +83,8 @@ export function createScenario(
   target = Math.min(41, config.planes * config.perPlane - 1),
 ): Scenario {
   return {
-    schemaVersion: 8,
+    schemaVersion: 9,
+    ground: null,
     mcsrSearch: searchDefaults(config.planes * config.perPlane),
     config: { ...config },
     srd: {
@@ -122,10 +126,11 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 5 &&
     version !== 6 &&
     version !== 7 &&
-    version !== 8
+    version !== 8 &&
+    version !== 9
   )
     throw new Error("지원하지 않는 시나리오 버전입니다.");
-  const scenario = { ...structuredClone(input), schemaVersion: 8 } as Scenario;
+  const scenario = { ...structuredClone(input), schemaVersion: 9 } as Scenario;
   if (
     version !== 3 &&
     version !== 4 &&
@@ -133,6 +138,7 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 6 &&
     version !== 7 &&
     version !== 8 &&
+    version !== 9 &&
     scenario.linkMetricUpdates === undefined
   )
     scenario.linkMetricUpdates = [];
@@ -141,7 +147,8 @@ export function normalizeScenario(input: unknown): Scenario {
     version !== 5 &&
     version !== 6 &&
     version !== 7 &&
-    version !== 8
+    version !== 8 &&
+    version !== 9
   ) {
     scenario.routing ??= {
       algorithm: "bfs",
@@ -151,18 +158,19 @@ export function normalizeScenario(input: unknown): Scenario {
     scenario.notificationDelayUs ??= 0;
     scenario.switchDelayUs ??= 0;
   }
-  if (version !== 6 && version !== 7 && version !== 8)
+  if (version !== 6 && version !== 7 && version !== 8 && version !== 9)
     scenario.srd = {
       planesPerDomain: Math.min(2, scenario.config?.planes),
       satellitesPerDomain: Math.min(2, scenario.config?.perPlane),
     };
-  if (version !== 7 && version !== 8)
+  if (version !== 7 && version !== 8 && version !== 9)
     scenario.controlTransport = { mode: "fixed", ackTimeoutUs: SECOND };
-  if (version !== 8)
+  if (version !== 8 && version !== 9)
     scenario.mcsrSearch = searchDefaults(
       scenario.config?.planes * scenario.config?.perPlane,
       "reference",
     );
+  if (version !== 9) scenario.ground = null;
   validateScenario(scenario);
   return scenario;
 }
@@ -179,8 +187,10 @@ export type TopologyDelta = {
   analysis?: RoutingAnalysis;
   mcsr?: McsrView;
   mcsrDelta?: McsrDelta;
+  ground?: GroundView;
 };
 export type RenderCheckpoint = {
+  ground?: GroundView;
   timeUs: number;
   stateRevision: number;
   version: number;
@@ -197,7 +207,7 @@ function integer(value: number, min: number, max: number, label: string) {
 export function validateScenario(s: Scenario) {
   if (!s || typeof s !== "object" || !s.config)
     throw new Error("시나리오 형식이 올바르지 않습니다.");
-  if (s.schemaVersion !== 8)
+  if (s.schemaVersion !== 9)
     throw new Error("지원하지 않는 시나리오 버전입니다.");
   if (
     !s.controlTransport ||
@@ -226,6 +236,11 @@ export function validateScenario(s: Scenario) {
     s.srd.planesPerDomain * s.srd.satellitesPerDomain > 32
   )
     throw new Error("확장 모드 SRD는 32기 이하로 분할하세요.");
+  validateGround(s.ground);
+  if (s.ground && s.routing?.algorithm === "candidate-paths")
+    throw new Error(
+      "지상 모드는 고정 수동 후보 대신 BFS·자동 우세 경로·MCSR을 사용하세요.",
+    );
   const invalid = validate(s.config);
   if (invalid) throw new Error(invalid);
   integer(s.epochMs, 0, 8640000000000000, "시작 시각");
@@ -351,6 +366,14 @@ export class SimulationEngine {
   readonly metrics: MetricsEngine;
   readonly profiling: { atUs: number; wallMs: number }[] = [];
   readonly edges: [number, number][];
+  private groundAccess?: GroundAccess;
+  private groundMetrics?: GroundMetrics;
+  private groundRoutePending = false;
+  private groundWasReady = false;
+  private committedGroundKey = "";
+  private cachedGroundView?: { key: string; view: GroundView };
+  private sourceNode = 0;
+  private targetNode = 0;
   nowUs = 0;
   private queue = new EventQueue();
   private sequence = 0;
@@ -443,7 +466,22 @@ export class SimulationEngine {
         calculate: (_graph, source, target, report) =>
           this.mcsr!.calculate(source, target, report),
       });
-    this.metrics = new MetricsEngine(scenario.source, scenario.target);
+    this.sourceNode = scenario.source;
+    this.targetNode = scenario.target;
+    if (scenario.ground) {
+      this.groundAccess = new GroundAccess(scenario.ground);
+      this.groundMetrics = new GroundMetrics();
+      this.groundAccess.update(
+        positions(scenario.config, 0, scenario.epochMs),
+        0,
+      );
+      this.sourceNode = this.groundAccess.source ?? this.sourceNode;
+      this.targetNode = this.groundAccess.target ?? this.targetNode;
+      this.groundWasReady = this.groundAccess.ready(0);
+    }
+    this.metrics = new MetricsEngine(this.sourceNode, this.targetNode);
+    if (this.groundAccess && !this.groundWasReady)
+      this.metrics.setMonitoring(0, false);
     this.edges = mesh(scenario.config);
     this.geometric = this.geometry(0);
     this.physical = new Set(this.geometric);
@@ -477,9 +515,9 @@ export class SimulationEngine {
         scenario.config,
         scenario.srd,
         this.observedGraph(),
-        scenario.source,
+        this.sourceNode,
         scenario.mcsrSearch,
-        scenario.target,
+        this.targetNode,
       );
     if (this.mcsr && scenario.controlTransport.mode === "isl") {
       this.control = new ControlTransport(
@@ -550,6 +588,7 @@ export class SimulationEngine {
     if (!this.pendingJob) this.observeService();
     this.committedMcsr = this.mcsrView();
     this.committedMcsrKey = this.mcsrStateKey(this.committedMcsr);
+    this.committedGroundKey = JSON.stringify(this.groundView());
     this.scheduleTopology(SECOND);
     for (const e of scenario.failures) this.scheduleFailure(e);
   }
@@ -650,6 +689,8 @@ export class SimulationEngine {
       const next = this.geometry(this.nowUs);
       this.geometric = next;
       this.stagePhysical();
+      if (this.groundAccess)
+        this.schedule(this.nowUs, 1.75, () => this.refreshGround());
       if (
         (this.strategy.reactsToMetrics !== false ||
           this.scenario.routing.service === "HR") &&
@@ -694,7 +735,72 @@ export class SimulationEngine {
       }
     });
   }
+  private groundView(
+    pathValid = this.serviceDirty ? this.validPath() : this.committedValid,
+  ): GroundView | undefined {
+    const access = this.groundAccess;
+    if (!access) return undefined;
+    const sample = Math.floor(this.nowUs / SECOND);
+    const key = `${sample}:${access.source}:${access.target}:${access.readinessKey(this.nowUs)}:${this.groundRoutePending}:${pathValid}`;
+    if (this.cachedGroundView?.key === key) return this.cachedGroundView.view;
+    const p: ReturnType<typeof positions> = [];
+    for (const id of [access.source, access.target])
+      if (id !== null)
+        p[id] = position(
+          this.scenario.config,
+          id,
+          sample,
+          this.scenario.epochMs,
+        );
+    const view = access.view(p, this.nowUs, this.groundRoutePending, pathValid);
+    this.cachedGroundView = { key, view };
+    return view;
+  }
+  private refreshGround() {
+    const access = this.groundAccess;
+    if (!access) return;
+    const changed = access.update(
+      positions(
+        this.scenario.config,
+        this.nowUs / SECOND,
+        this.scenario.epochMs,
+      ),
+      this.nowUs,
+    );
+    const ready = access.ready(this.nowUs);
+    if (changed) {
+      this.metrics.setMonitoring(this.nowUs, false);
+      this.sourceNode = access.source ?? this.sourceNode;
+      this.targetNode = access.target ?? this.targetNode;
+      this.installed = [];
+      this.installedKey = "";
+      this.installedEvaluation = null;
+      this.cachedCandidates = [];
+      this.groundRoutePending = true;
+      if (this.mcsr) {
+        this.mcsr.setEndpoints(this.sourceNode, this.targetNode);
+        this.control?.setFocusDomain(this.mcsr.sourceDomain);
+        this.updateMcsr("ground-endpoints");
+      }
+      for (const atUs of access.readyTimesUs)
+        if (atUs > this.nowUs)
+          this.schedule(atUs, 1.75, () => this.refreshGround());
+      this.metrics.record({
+        atUs: this.nowUs,
+        type: "ground-attachment-changed",
+        reason: `${access.source ?? "none"}->${access.target ?? "none"}`,
+      });
+    }
+    if (changed || ready !== this.groundWasReady) {
+      this.serviceDirty = true;
+      this.inputsChanged(ready ? "ground-ready" : "ground-access-change");
+    }
+    this.serviceDirty = true;
+    this.groundWasReady = ready;
+  }
   private observeService(available = this.validPath()) {
+    const ground = this.groundView(available);
+    if (ground) this.groundMetrics!.observe(this.nowUs, ground);
     const missing = new Set<string>();
     for (const path of !available || this.metrics.previousPath.length
       ? [this.installed, this.metrics.previousPath]
@@ -757,12 +863,22 @@ export class SimulationEngine {
       : this.mcsrStateKey(this.mcsrView());
     const mcsrChanged = mcsrKey !== this.committedMcsrKey;
     const mcsr = mcsrChanged ? this.mcsrView() : this.committedMcsr;
-    if (changedLinks.length || routeChanged || analysisChanged || mcsrChanged) {
+    const ground = this.groundView(pathValid);
+    const groundKey = JSON.stringify(ground);
+    const groundChanged = groundKey !== this.committedGroundKey;
+    if (
+      changedLinks.length ||
+      routeChanged ||
+      analysisChanged ||
+      mcsrChanged ||
+      groundChanged
+    ) {
       this.deltas.push({
         timeUs: this.nowUs,
         stateRevision: ++this.stateRevision,
         version: this.version,
         changedLinks,
+        ...(groundChanged && ground ? { ground: structuredClone(ground) } : {}),
         ...(mcsrChanged && mcsr
           ? bounded && this.committedMcsr
             ? { mcsrDelta: diffMcsr(this.committedMcsr, mcsr) }
@@ -779,6 +895,7 @@ export class SimulationEngine {
     this.committedMcsr = mcsr;
     this.committedMcsrKey = mcsrKey;
     this.committedAnalysisKey = `${this.analysis.id}:${this.analysis.status}`;
+    this.committedGroundKey = groundKey;
     this.committedPath = path;
     this.committedValid = pathValid;
   }
@@ -793,6 +910,9 @@ export class SimulationEngine {
       stateRevision: this.stateRevision,
       version: this.version,
       links: structuredClone([...this.committedLinks.values()]),
+      ...(this.groundAccess
+        ? { ground: structuredClone(this.groundView()) }
+        : {}),
       analysis: structuredClone(this.analysis),
       ...(this.mcsr
         ? { mcsr: structuredClone(this.committedMcsr ?? this.mcsrView()) }
@@ -804,9 +924,10 @@ export class SimulationEngine {
   private validPath() {
     const nodes = this.installed;
     return (
+      (!this.groundAccess || this.groundAccess.ready(this.nowUs)) &&
       nodes.length > 0 &&
-      nodes[0] === this.scenario.source &&
-      nodes.at(-1) === this.scenario.target &&
+      nodes[0] === this.sourceNode &&
+      nodes.at(-1) === this.targetNode &&
       new Set(nodes).size === nodes.length &&
       nodes.every(
         (v, i) =>
@@ -1042,13 +1163,20 @@ export class SimulationEngine {
     try {
       let raw: PathCandidate[];
       if (
+        this.groundAccess &&
+        (!this.groundAccess.ready(this.nowUs) ||
+          this.mcsr?.endpointSummariesReady === false)
+      ) {
+        raw = [];
+        if (this.mcsr) this.mcsr.lastAnalysis = undefined;
+      } else if (
         this.builtinMcsr &&
         this.mcsr &&
         this.scenario.mcsrSearch.mode === "bounded"
       ) {
         const job = this.mcsr.calculateSteps(
-          this.scenario.source,
-          this.scenario.target,
+          this.sourceNode,
+          this.targetNode,
           (summary) => {
             search = structuredClone(summary);
           },
@@ -1064,8 +1192,8 @@ export class SimulationEngine {
       } else
         raw = this.strategy.calculate(
           structuredClone(graph),
-          this.scenario.source,
-          this.scenario.target,
+          this.sourceNode,
+          this.targetNode,
           (summary) => {
             search = structuredClone(summary);
           },
@@ -1075,8 +1203,8 @@ export class SimulationEngine {
       candidates = validateCandidates(
         raw,
         graph,
-        this.scenario.source,
-        this.scenario.target,
+        this.sourceNode,
+        this.targetNode,
       );
       if (raw.length !== candidates.length)
         this.metrics.record({
@@ -1113,6 +1241,8 @@ export class SimulationEngine {
     const evaluation = {
       evaluatedUs: this.nowUs,
       inputRevision: this.inputRevision,
+      source: this.sourceNode,
+      target: this.targetNode,
       candidates: structuredClone(candidates),
       ...(search ? { search } : {}),
       ...(this.mcsr ? { mcsr: structuredClone(this.mcsr.lastAnalysis) } : {}),
@@ -1182,7 +1312,13 @@ export class SimulationEngine {
     this.routingReasons.add(reason);
     const interval =
       this.scenario.mcsrSearch.mode === "bounded" &&
-      !["link-down", "link-up"].includes(reason)
+      ![
+        "link-down",
+        "link-up",
+        "ground-ready",
+        "ground-access-change",
+        "ground-endpoints",
+      ].includes(reason)
         ? this.scenario.mcsrSearch.metricCoalesceUs
         : 0;
     const atUs = interval
@@ -1305,6 +1441,18 @@ export class SimulationEngine {
         }
         this.decisionStatus(decisionId, "installed");
         const wasAvailable = this.validPath();
+        if (
+          this.groundAccess?.ready(this.nowUs) &&
+          (this.mcsr?.endpointSummariesReady ?? true)
+        ) {
+          this.groundRoutePending = false;
+          this.metrics.setMonitoring(
+            this.nowUs,
+            true,
+            this.sourceNode,
+            this.targetNode,
+          );
+        }
         this.installed = [...path];
         this.installedKey = this.installed.join(":");
         this.serviceDirty = true;
@@ -1405,6 +1553,8 @@ export class SimulationEngine {
       this.nowUs / SECOND,
       this.scenario.epochMs,
     );
+    const ground = this.groundView();
+    const currentPathMetrics = this.currentPathMetrics(p);
     return {
       failure: structuredClone(this.failure),
       timeUs: this.nowUs,
@@ -1412,11 +1562,30 @@ export class SimulationEngine {
       stateRevision: this.stateRevision,
       path: [...this.installed],
       pathValid: this.validPath(),
+      routingSource:
+        this.groundAccess && this.groundAccess.source === null
+          ? null
+          : this.sourceNode,
+      routingTarget:
+        this.groundAccess && this.groundAccess.target === null
+          ? null
+          : this.targetNode,
+      ground: structuredClone(ground),
+      groundService: this.groundMetrics?.summary(this.nowUs, 6),
+      groundAccessEvents: structuredClone(this.groundAccess?.events.slice(-6)),
+      groundPropagationDelayMs: ground?.available
+        ? Math.round(
+            (((ground.ut.distanceM! + ground.gs.distanceM!) / 299792458) *
+              1000 +
+              (currentPathMetrics.candidate?.propagationDelayMs ?? 0)) *
+              1e9,
+          ) / 1e9
+        : null,
       length: pathLength(this.installed, p),
       routingAlgorithm: this.strategy.name,
       mcsr: structuredClone(this.mcsrView()),
       routingAnalysis: structuredClone(this.analysis),
-      currentPathMetrics: this.currentPathMetrics(p),
+      currentPathMetrics,
       routingStages: this.metrics.events
         .slice(-24)
         .filter((e) =>
@@ -1444,6 +1613,14 @@ export class SimulationEngine {
       throw new Error("현재 논리 시각의 계산이 완료되지 않았습니다.");
     return {
       modelVersion: MODEL_VERSION,
+      ...(this.groundAccess
+        ? {
+            ground: structuredClone(this.groundView()),
+            groundPropagationDelayMs: this.progress().groundPropagationDelayMs,
+            groundService: this.groundMetrics!.result(this.nowUs),
+            groundAccessEvents: structuredClone(this.groundAccess.events),
+          }
+        : {}),
       routingAlgorithm: this.strategy.name,
       routingEvaluations: structuredClone(this.routingEvaluations),
       routingAnalyses: structuredClone(this.analyses),

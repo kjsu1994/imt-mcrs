@@ -45,6 +45,7 @@ export class TopologyStream {
       this.received = {
         ...this.received,
         ...d.route,
+        ...(d.ground ? { ground: d.ground } : {}),
         ...(d.analysis ? { analysis: d.analysis } : {}),
         ...(d.mcsr
           ? { mcsr: d.mcsr }
@@ -65,6 +66,8 @@ export class TopologyStream {
       checkpoint.links.length !== this.latest.size ||
       checkpoint.version !== this.received.version ||
       JSON.stringify(checkpoint.mcsr) !== JSON.stringify(this.received.mcsr) ||
+      JSON.stringify(checkpoint.ground) !==
+        JSON.stringify(this.received.ground) ||
       checkpoint.analysis.id !== this.received.analysis.id ||
       checkpoint.analysis.status !== this.received.analysis.status ||
       checkpoint.pathValid !== this.received.pathValid ||
@@ -94,6 +97,7 @@ export class TopologyStream {
       this.displayed = {
         ...this.displayed,
         ...d.route,
+        ...(d.ground ? { ground: d.ground } : {}),
         ...(d.analysis ? { analysis: d.analysis } : {}),
         ...(d.mcsr
           ? { mcsr: d.mcsr }

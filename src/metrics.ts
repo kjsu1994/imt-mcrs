@@ -26,6 +26,7 @@ export type ServiceOutage = {
   target: number;
   startedUs: number;
   recoveredUs: number | null;
+  censoredUs: number | null;
   detectedUs: number | null;
   sourceInformedUs: number | null;
   recoveryMechanism: "reserve" | "recalculate" | "physical-restoration" | null;
@@ -44,6 +45,37 @@ export class MetricsEngine {
     private source: number,
     private target: number,
   ) {}
+  private monitoring = true;
+  private monitoredSince = 0;
+  private monitoredUs = 0;
+  setMonitoring(
+    atUs: number,
+    enabled: boolean,
+    source = this.source,
+    target = this.target,
+  ) {
+    if (
+      enabled === this.monitoring &&
+      source === this.source &&
+      target === this.target
+    )
+      return;
+    if (this.monitoring) this.monitoredUs += atUs - this.monitoredSince;
+    if (this.open) {
+      this.open.censoredUs = atUs;
+      this.record({
+        atUs,
+        type: "service-observation-ended",
+        outageId: this.open.id,
+        reason: "ground-access-change",
+      });
+      this.open = null;
+    }
+    this.monitoring = enabled;
+    this.monitoredSince = atUs;
+    this.source = source;
+    this.target = target;
+  }
   get previousPath() {
     return this.open?.previousPath ?? [];
   }
@@ -82,6 +114,7 @@ export class MetricsEngine {
     knownGraph?: RoutingGraph,
     installedMode: "initial" | "reserve" | "recalculate" | null = null,
   ) {
+    if (!this.monitoring) return;
     if (!available && !this.open) {
       this.open = {
         id: this.serviceOutages.length + 1,
@@ -89,6 +122,7 @@ export class MetricsEngine {
         target: this.target,
         startedUs: atUs,
         recoveredUs: null,
+        censoredUs: null,
         detectedUs: null,
         sourceInformedUs: null,
         recoveryMechanism: null,
@@ -142,8 +176,11 @@ export class MetricsEngine {
     // Availability measures [0, timeUs); a new outage exactly at the endpoint has no exposure yet.
     const measured = this.serviceOutages.filter((o) => o.startedUs < timeUs);
     const recovered = measured.filter((o) => o.recoveredUs !== null);
+    const censored = measured.filter((o) => o.censoredUs !== null);
+    const monitoredUs =
+      this.monitoredUs + (this.monitoring ? timeUs - this.monitoredSince : 0);
     const totalDowntimeUs = measured.reduce(
-      (sum, o) => sum + (o.recoveredUs ?? timeUs) - o.startedUs,
+      (sum, o) => sum + (o.recoveredUs ?? o.censoredUs ?? timeUs) - o.startedUs,
       0,
     );
     const entries = this.serviceOutages
@@ -153,10 +190,12 @@ export class MetricsEngine {
         status:
           o.recoveredUs !== null
             ? "recovered"
-            : completed
-              ? "unrecovered"
-              : "pending",
-        durationUs: (o.recoveredUs ?? timeUs) - o.startedUs,
+            : o.censoredUs !== null
+              ? "censored"
+              : completed
+                ? "unrecovered"
+                : "pending",
+        durationUs: (o.recoveredUs ?? o.censoredUs ?? timeUs) - o.startedUs,
         recoveryUs: o.recoveredUs === null ? null : o.recoveredUs - o.startedUs,
         sourceNotificationUs:
           o.sourceInformedUs === null ? null : o.sourceInformedUs - o.startedUs,
@@ -176,10 +215,17 @@ export class MetricsEngine {
         (o) => o.reason === "initial-unreachable",
       ).length,
       totalDowntimeUs,
-      availability: timeUs === 0 ? null : 1 - totalDowntimeUs / timeUs,
+      monitoredUs,
+      censoredCount: censored.length,
+      availability:
+        monitoredUs === 0 ? null : 1 - totalDowntimeUs / monitoredUs,
       recoveredCount: recovered.length,
-      unrecoveredCount: completed ? measured.length - recovered.length : 0,
-      pendingCount: completed ? 0 : measured.length - recovered.length,
+      unrecoveredCount: completed
+        ? measured.length - recovered.length - censored.length
+        : 0,
+      pendingCount: completed
+        ? 0
+        : measured.length - recovered.length - censored.length,
       meanOutageUs: recovered.length
         ? recovered.reduce((sum, o) => sum + o.recoveredUs! - o.startedUs, 0) /
           recovered.length

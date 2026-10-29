@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import type { GroundSettings, GroundPoint, GroundRole } from "./ground";
+import { useEffect, useRef, useState } from "react";
 import {
   Viewer,
   BillboardCollection,
@@ -59,6 +60,8 @@ type Props = {
   controlPath: number[];
   tracking: boolean;
   home: number;
+  groundSettings: GroundSettings | null;
+  onGroundPick: (role: GroundRole, point: GroundPoint) => void;
   onPick: (id: number) => void;
   onTelemetry: (s: Telemetry) => void;
   onPickLink: (id: string) => void;
@@ -74,6 +77,28 @@ const palette = [
 ];
 const cart = (p: Vec3) => new Cartesian3(p.x, p.y, p.z);
 export default function Globe(props: Props) {
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    point: GroundPoint;
+  } | null>(null);
+  const menuElement = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    const outside = (e: PointerEvent) => {
+      if (!menuElement.current?.contains(e.target as Node)) setMenu(null);
+    };
+    document.addEventListener("keydown", key);
+    document.addEventListener("pointerdown", outside);
+    menuElement.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    return () => {
+      document.removeEventListener("keydown", key);
+      document.removeEventListener("pointerdown", outside);
+    };
+  }, [menu]);
   const container = useRef<HTMLDivElement>(null),
     current = useRef(props);
   current.current = props;
@@ -149,6 +174,42 @@ export default function Globe(props: Props) {
         new LabelCollection(),
       ) as LabelCollection;
       const iconDistance = 5000000;
+      const groundIcons = viewer.scene.primitives.add(
+        new BillboardCollection(),
+      ) as BillboardCollection;
+      const groundLabels = viewer.scene.primitives.add(
+        new LabelCollection(),
+      ) as LabelCollection;
+      const groundLinks = viewer.scene.primitives.add(
+        new PolylineCollection(),
+      ) as PolylineCollection;
+      for (const role of ["ut", "gs"] as const) {
+        groundIcons.add({
+          id: `ground:${role}`,
+          position: Cartesian3.ZERO,
+          show: false,
+          image: `${import.meta.env.BASE_URL}textures/ground-${role}.svg`,
+          width: 30,
+          height: 30,
+        });
+        groundLabels.add({
+          position: Cartesian3.ZERO,
+          show: false,
+          text: role.toUpperCase(),
+          font: "bold 13px sans-serif",
+          fillColor: Color.fromCssColorString(
+            role === "ut" ? "#80efbb" : "#ffbb78",
+          ),
+          pixelOffset: new Cartesian2(0, -26),
+          showBackground: true,
+          backgroundColor: Color.fromCssColorString("#101827").withAlpha(0.9),
+        });
+        groundLinks.add({
+          positions: [Cartesian3.ZERO, Cartesian3.ZERO],
+          show: false,
+          width: 3,
+        });
+      }
       const packets = viewer.scene.primitives.add(
         new PointPrimitiveCollection(),
       ) as PointPrimitiveCollection;
@@ -204,7 +265,33 @@ export default function Globe(props: Props) {
         )
           current.current.onPickLink(picked.id.slice(4));
       }, ScreenSpaceEventType.LEFT_CLICK);
+      handler.setInputAction((event: { position: Cartesian2 }) => {
+        const ray = viewer!.camera.getPickRay(event.position);
+        const surface = ray
+          ? viewer!.scene.globe.pick(ray, viewer!.scene)
+          : undefined;
+        if (!surface) {
+          setMenu(null);
+          return;
+        }
+        const coordinate = Cartographic.fromCartesian(surface);
+        setMenu({
+          x: Math.max(
+            8,
+            Math.min(event.position.x, viewer!.scene.canvas.clientWidth - 238),
+          ),
+          y: Math.max(
+            8,
+            Math.min(event.position.y, viewer!.scene.canvas.clientHeight - 168),
+          ),
+          point: {
+            latitude: CMath.toDegrees(coordinate.latitude),
+            longitude: CMath.toDegrees(coordinate.longitude),
+          },
+        });
+      }, ScreenSpaceEventType.RIGHT_CLICK);
       handler.setInputAction(() => {
+        setMenu(null);
         dragging = true;
       }, ScreenSpaceEventType.LEFT_DOWN);
       handler.setInputAction(() => {
@@ -280,6 +367,9 @@ export default function Globe(props: Props) {
         );
         const display = p.frame ? p.topology.at(displayClock.at(now)) : null;
         const path = display?.path ?? [];
+        const ground = display?.ground;
+        const source = ground ? ground.ut.satelliteId : p.source;
+        const target = ground ? ground.gs.satelliteId : p.target;
         if (config !== p.config) {
           config = p.config;
           points.removeAll();
@@ -341,6 +431,35 @@ export default function Globe(props: Props) {
         }
         const pos = positions(p.config, seconds, p.startMs);
         const scenePositions = pos.map(cart);
+        const groundPositions: Partial<Record<GroundRole, Cartesian3>> = {};
+        for (const [i, role] of (["ut", "gs"] as const).entries()) {
+          const point = p.groundSettings?.[role],
+            attachment = ground?.[role];
+          const icon = groundIcons.get(i),
+            label = groundLabels.get(i),
+            line = groundLinks.get(i);
+          icon.show = label.show = !!point;
+          line.show = !!point && attachment?.satelliteId != null;
+          if (!point) continue;
+          // A small display offset keeps the marker above the ellipsoid; simulation ground altitude remains zero.
+          const at = Cartesian3.fromDegrees(
+            point.longitude,
+            point.latitude,
+            500,
+          );
+          groundPositions[role] = at;
+          icon.position = label.position = at;
+          if (line.show && attachment?.satelliteId != null) {
+            line.positions = [at, scenePositions[attachment.satelliteId]];
+            line.material.uniforms.color = Color.fromCssColorString(
+              !attachment.ready
+                ? "#ff7a82"
+                : role === "ut"
+                  ? "#80efbb"
+                  : "#ffbb78",
+            );
+          }
+        }
         const iconView =
           Cartesian3.magnitude(viewer.camera.positionWC) <
           EARTH_RADIUS + p.config.altitude * 1000 + iconDistance;
@@ -367,13 +486,13 @@ export default function Globe(props: Props) {
           label.show =
             dsLabels.length <= 16 ||
             domain.id === srd!.sourceDomain ||
-            domain.id === srd!.membership[p.target] ||
+            domain.id === srd!.membership[target ?? -1] ||
             (p.selected !== null &&
               domain.id === srd!.membership[p.selected]) ||
             Cartesian3.distance(viewer.camera.positionWC, label.position) <
               iconDistance / 2;
         }
-        const styleKey = `${p.selected}:${p.source}:${p.target}:${srd?.membership.join(":") ?? ""}`;
+        const styleKey = `${p.selected}:${source}:${target}:${srd?.membership.join(":") ?? ""}`;
         for (let id = 0; id < pos.length; id++) {
           const dot = points.get(id);
           dot.position = scenePositions[id];
@@ -393,15 +512,15 @@ export default function Globe(props: Props) {
             dot.pixelSize =
               id === p.selected
                 ? 11
-                : id === p.source || id === p.target
+                : id === source || id === target
                   ? 8
                   : isDs
                     ? 9
                     : 5;
             dot.color = Color.fromCssColorString(
-              id === p.source
+              id === source
                 ? "#80efbb"
-                : id === p.target
+                : id === target
                   ? "#ffbb78"
                   : palette[
                       (srd?.membership[id] ??
@@ -595,23 +714,27 @@ export default function Globe(props: Props) {
           controlLines.get(0).positions = controlPath.map(
             (id) => scenePositions[id],
           );
+        const flowPositions = path.map((id) => scenePositions[id]);
+        if (ground?.available && groundPositions.ut && groundPositions.gs) {
+          flowPositions.unshift(groundPositions.ut);
+          flowPositions.push(groundPositions.gs);
+        }
         for (let i = 0; i < packets.length; i++) {
           const dot = packets.get(i);
-          dot.show = path.length > 1 && !!display?.pathValid;
-          if (path.length > 1) {
-            const progress =
-                (((seconds / 16 + i / packets.length) % 1) + 1) % 1,
-              hop = progress * (path.length - 1),
-              index = Math.min(Math.floor(hop), path.length - 2),
-              a = pos[path[index]],
-              b = pos[path[index + 1]],
-              t = hop - index;
-            dot.position = new Cartesian3(
-              a.x + (b.x - a.x) * t,
-              a.y + (b.y - a.y) * t,
-              a.z + (b.z - a.z) * t,
-            );
-          }
+          dot.show =
+            flowPositions.length > 1 &&
+            !!display?.pathValid &&
+            (!ground || ground.available);
+          if (!dot.show) continue;
+          const progress = (((seconds / 16 + i / packets.length) % 1) + 1) % 1;
+          const hop = progress * (flowPositions.length - 1);
+          const index = Math.min(Math.floor(hop), flowPositions.length - 2);
+          dot.position = Cartesian3.lerp(
+            flowPositions[index],
+            flowPositions[index + 1],
+            hop - index,
+            new Cartesian3(),
+          );
         }
         if (
           lastSelected !== p.selected ||
@@ -645,7 +768,15 @@ export default function Globe(props: Props) {
         if (lastHome !== p.home) {
           viewer.camera.lookAtTransform(Matrix4.IDENTITY);
           viewer.camera.setView({
-            destination: Cartesian3.fromDegrees(118, 18, 21000000),
+            destination: Cartesian3.fromDegrees(
+              p.groundSettings?.ut?.longitude ??
+                p.groundSettings?.gs?.longitude ??
+                118,
+              p.groundSettings?.ut?.latitude ??
+                p.groundSettings?.gs?.latitude ??
+                18,
+              21000000,
+            ),
             orientation: { heading: 0, pitch: -Math.PI / 2, roll: 0 },
           });
           centerOnEarth();
@@ -698,6 +829,47 @@ export default function Globe(props: Props) {
     };
   }, [props.startMs]);
   return (
-    <div className="globe" ref={container} aria-label="LEO 위성망 3D 지구본" />
+    <div className="globe-shell" onContextMenu={(e) => e.preventDefault()}>
+      <div
+        className="globe"
+        ref={container}
+        aria-label="LEO 위성망 3D 지구본"
+      />
+      {menu && (
+        <div
+          ref={menuElement}
+          className="ground-menu"
+          role="menu"
+          aria-label="지상 노드 지정"
+          style={{ left: menu.x, top: menu.y }}
+        >
+          <span>
+            {menu.point.latitude.toFixed(4)}°, {menu.point.longitude.toFixed(4)}
+            °
+          </span>
+          <button
+            role="menuitem"
+            onClick={() => {
+              props.onGroundPick("ut", menu.point);
+              setMenu(null);
+            }}
+          >
+            여기에 사용자 단말(UT) 지정
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => {
+              props.onGroundPick("gs", menu.point);
+              setMenu(null);
+            }}
+          >
+            여기에 지상국(GS) 지정
+          </button>
+          <button role="menuitem" onClick={() => setMenu(null)}>
+            닫기
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

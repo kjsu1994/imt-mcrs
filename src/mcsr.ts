@@ -149,7 +149,7 @@ function abort(
 }
 export class McsrController {
   readonly partition: SrdPartition;
-  readonly sourceDomain: number;
+  sourceDomain: number;
   readonly events: CsibEvent[] = [];
   private owned: DomainAdvertisement[];
   private bootstrap: DomainAdvertisement[];
@@ -157,6 +157,7 @@ export class McsrController {
   private signatures: string[];
   private nodeCount: number;
   private sourceNode: number;
+  private targetEndpointRevision = 0;
   private verificationGraph: RoutingGraph;
   lastAnalysis: McsrAnalysis | undefined;
   viewRevision = 0;
@@ -211,6 +212,27 @@ export class McsrController {
     this.bootstrap = [...this.owned];
     // Initial synchronized bootstrap, before the measured experiment begins.
     this.csibs = this.owned.map(() => [...this.owned]);
+  }
+  setEndpoints(source: number, target: number) {
+    validateRoutingGraph(this.graph(undefined, false), source, target);
+    if (source === this.sourceNode && target === this.target) return;
+    for (const node of [this.sourceNode, this.target, source, target])
+      this.signatures[this.partition.membership[node]] = "";
+    this.sourceNode = source;
+    this.target = target;
+    this.targetEndpointRevision =
+      this.owned[this.partition.membership[target]].revision + 1;
+    this.sourceDomain = this.partition.membership[source];
+    this.inputCache = undefined;
+    this.lastAnalysis = undefined;
+    this.viewRevision++;
+  }
+  get endpointSummariesReady(): boolean {
+    return (
+      this.search.mode === "reference" ||
+      this.csibs[this.sourceDomain][this.partition.membership[this.target]]
+        .revision >= this.targetEndpointRevision
+    );
   }
   private ownerLinks(graph: RoutingGraph, domainId: number) {
     return graph.links.filter(
@@ -588,12 +610,17 @@ export class McsrController {
               changed = true;
             }
     }
-    return (this.inputCache = fingerprint(
-      graph.links.filter(
-        (l) => reachable.has(l.sourceId) || reachable.has(l.targetId),
-      ),
-    ));
+    const ads = this.csibs[this.sourceDomain];
+    // An endpoint-only advertisement can change available segments without changing any link observation.
+    return (this.inputCache =
+      fingerprint(
+        graph.links.filter(
+          (l) => reachable.has(l.sourceId) || reachable.has(l.targetId),
+        ),
+      ) +
+      `|${this.sourceNode}:${this.target}:${ads[this.sourceDomain].revision}:${ads[this.partition.membership[this.target]].revision}`);
   }
+
   describe(candidates: PathCandidate[]): McsrAnalysis {
     const ads = this.csibs[this.sourceDomain],
       graph = this.graph(undefined, false);

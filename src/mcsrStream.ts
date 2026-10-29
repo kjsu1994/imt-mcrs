@@ -1,6 +1,7 @@
 import type { McsrView } from "./mcsr";
 import type { ControlFlight, ControlView } from "./controlTransport";
 export interface McsrDelta {
+  sourceDomain?: number;
   domains: McsrView["domains"];
   events: McsrView["events"];
   control?: Omit<ControlView, "flights"> & {
@@ -35,6 +36,7 @@ export function diffMcsr(previous: McsrView, next: McsrView): McsrDelta {
   );
   const { flights, ...control } = next.control ?? { flights: [] };
   return {
+    sourceDomain: next.sourceDomain,
     domains,
     events: next.events,
     ...(next.control
@@ -75,6 +77,9 @@ export function applyMcsr(
   }
   return {
     ...previous,
+    ...(delta.sourceDomain !== undefined
+      ? { sourceDomain: delta.sourceDomain }
+      : {}),
     domains,
     events: delta.events,
     ...(control ? { control } : {}),

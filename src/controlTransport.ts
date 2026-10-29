@@ -149,6 +149,12 @@ export class ControlTransport {
     )
       throw new Error("잘못된 제어 통신 설정입니다.");
   }
+  setFocusDomain(domain: number) {
+    if (this.limits && this.limits.focusDomain !== domain) {
+      this.limits.focusDomain = domain;
+      this.displayRevision++;
+    }
+  }
   private key(origin: number, recipient: number) {
     return `${origin}:${recipient}`;
   }

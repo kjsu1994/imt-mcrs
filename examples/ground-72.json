@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 9,
+  "ground": {
+    "ut": {
+      "latitude": 19.4326,
+      "longitude": -99.1332
+    },
+    "gs": {
+      "latitude": 34.0522,
+      "longitude": -118.2437
+    },
+    "minimumElevationDeg": 10,
+    "handoverDelayUs": 100000
+  },
+  "mcsrSearch": {
+    "mode": "bounded",
+    "localCandidates": 4,
+    "labelsPerBoundary": 16,
+    "endCandidates": 8,
+    "expansionLimit": 200000,
+    "delayPublishIntervalUs": 30000000,
+    "metricCoalesceUs": 100000,
+    "traceLimit": 10000,
+    "controlEventLimit": 50000000
+  },
+  "config": {
+    "planes": 6,
+    "perPlane": 12,
+    "altitude": 550,
+    "inclination": 53,
+    "phase": 1
+  },
+  "srd": {
+    "planesPerDomain": 2,
+    "satellitesPerDomain": 4
+  },
+  "controlTransport": {
+    "mode": "isl",
+    "ackTimeoutUs": 1000000
+  },
+  "epochMs": 1767225600000,
+  "durationUs": 600000000,
+  "seed": 1,
+  "source": 0,
+  "target": 41,
+  "slsIntervalUs": 100000,
+  "computeDelayUs": 1000,
+  "installDelayUs": 1000,
+  "failures": [],
+  "linkMetricUpdates": [],
+  "routing": {
+    "algorithm": "bfs",
+    "service": "LS",
+    "candidatePaths": []
+  },
+  "notificationDelayUs": 0,
+  "switchDelayUs": 0
+}

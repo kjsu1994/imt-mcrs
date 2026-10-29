@@ -1,3 +1,7 @@
+import groundExample from "../examples/ground-72.json";
+import GroundPanel from "./GroundPanel";
+import { defaultGround } from "./ground";
+import type { GroundSettings, GroundPoint, GroundRole } from "./ground";
 import { searchDefaults } from "./boundedSearch";
 import mcsr72 from "../examples/mcsr-72.json";
 import mcsr1584 from "../examples/mcsr-1584.json";
@@ -171,6 +175,24 @@ export default function App() {
     } catch (e) {
       setInputError(e instanceof Error ? e.message : String(e));
     }
+  }
+  function applyGround(ground: GroundSettings | null) {
+    try {
+      const next = { ...structuredClone(frame?.scenario ?? scenario), ground };
+      validateScenario(next);
+      setPlaying(false);
+      setTracking(false);
+      setLoadedScenario(next);
+      setPreviewId("");
+      setInputError("");
+      setRight(true);
+      if (window.innerWidth <= 850) setLeft(false);
+    } catch (e) {
+      setInputError(e instanceof Error ? e.message : String(e));
+    }
+  }
+  function placeGround(role: GroundRole, point: GroundPoint) {
+    applyGround({ ...(scenario.ground ?? defaultGround()), [role]: point });
   }
   function endpoint(source: number, target: number) {
     setSource(source);
@@ -543,7 +565,7 @@ export default function App() {
                       ? " (16기 이하 필요)"
                       : ""}
                   </option>
-                  <option value="candidate-paths">
+                  <option value="candidate-paths" disabled={!!scenario.ground}>
                     수동 후보 · MCSR 미적용
                   </option>
                 </select>
@@ -583,6 +605,19 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              <button
+                onClick={() =>
+                  void importScenario(
+                    new File(
+                      [JSON.stringify(groundExample)],
+                      "ground-72.json",
+                      { type: "application/json" },
+                    ),
+                  )
+                }
+              >
+                지상 통신 예제 · 72기
+              </button>
               {scenario.routing.algorithm === "mcsr" && (
                 <div className="srd-settings" aria-label="SRD 설정">
                   <label className="field">
@@ -788,6 +823,8 @@ export default function App() {
               allOrbits={allOrbits}
               tracking={tracking}
               home={home}
+              groundSettings={scenario.ground}
+              onGroundPick={placeGround}
               onPick={setSelected}
               onTelemetry={setTelemetry}
               onPickLink={setSelectedLink}
@@ -854,57 +891,71 @@ export default function App() {
           >
             <section>
               <h2>노드 간 통신</h2>
-              <div className="endpoint">
-                <span className="source-dot" />
-                <label>
-                  출발 노드
-                  <select
-                    aria-label="출발 노드"
-                    value={source}
-                    onChange={(e) => endpoint(Number(e.target.value), target)}
-                  >
-                    {nodes}
-                  </select>
-                </label>
-                <button
-                  disabled={selected === null}
-                  title="선택 위성을 출발 노드로"
-                  aria-label="선택 위성을 출발 노드로"
-                  onClick={() =>
-                    selected !== null && endpoint(selected, target)
-                  }
-                >
-                  지정
-                </button>
-              </div>
-              <div className="endpoint">
-                <span className="target-dot" />
-                <label>
-                  도착 노드
-                  <select
-                    aria-label="도착 노드"
-                    value={target}
-                    onChange={(e) => endpoint(source, Number(e.target.value))}
-                  >
-                    {nodes}
-                  </select>
-                </label>
-                <button
-                  disabled={selected === null}
-                  title="선택 위성을 도착 노드로"
-                  aria-label="선택 위성을 도착 노드로"
-                  onClick={() =>
-                    selected !== null && endpoint(source, selected)
-                  }
-                >
-                  지정
-                </button>
-              </div>
+              <GroundPanel
+                settings={scenario.ground}
+                frame={frame}
+                onChange={applyGround}
+              />
+              {!scenario.ground && (
+                <>
+                  <div className="endpoint">
+                    <span className="source-dot" />
+                    <label>
+                      출발 노드
+                      <select
+                        aria-label="출발 노드"
+                        value={source}
+                        onChange={(e) =>
+                          endpoint(Number(e.target.value), target)
+                        }
+                      >
+                        {nodes}
+                      </select>
+                    </label>
+                    <button
+                      disabled={selected === null}
+                      title="선택 위성을 출발 노드로"
+                      aria-label="선택 위성을 출발 노드로"
+                      onClick={() =>
+                        selected !== null && endpoint(selected, target)
+                      }
+                    >
+                      지정
+                    </button>
+                  </div>
+                  <div className="endpoint">
+                    <span className="target-dot" />
+                    <label>
+                      도착 노드
+                      <select
+                        aria-label="도착 노드"
+                        value={target}
+                        onChange={(e) =>
+                          endpoint(source, Number(e.target.value))
+                        }
+                      >
+                        {nodes}
+                      </select>
+                    </label>
+                    <button
+                      disabled={selected === null}
+                      title="선택 위성을 도착 노드로"
+                      aria-label="선택 위성을 도착 노드로"
+                      onClick={() =>
+                        selected !== null && endpoint(source, selected)
+                      }
+                    >
+                      지정
+                    </button>
+                  </div>
+                </>
+              )}
               <div className="route-summary">
                 <span>
                   {snapshot.path.length > 1
                     ? `${snapshot.path.length - 1} 홉`
-                    : source === target
+                    : frame?.routingSource != null &&
+                        frame.routingSource === frame.routingTarget
                       ? "동일 노드"
                       : "경로 없음"}
                 </span>
@@ -921,7 +972,7 @@ export default function App() {
                 title="논리 시각 기준. 버퍼는 설정된 큐 상태, 지터는 가상 입력입니다."
               >
                 <div>
-                  <dt>전파 지연</dt>
+                  <dt>{scenario.ground ? "ISL 전파 지연" : "전파 지연"}</dt>
                   <dd>
                     {frame?.currentPathMetrics?.candidate
                       ? `${frame?.currentPathMetrics.candidate.propagationDelayMs.toFixed(2)} ms`
@@ -1405,7 +1456,14 @@ export default function App() {
                   </ol>
                 </details>
               ) : null}
-              <h3>서비스 중단</h3>
+              <h3>{scenario.ground ? "위성망 경로 중단" : "서비스 중단"}</h3>
+              {scenario.ground && (
+                <p className="model-caption">
+                  접속 전환·접속 불가 구간 제외 · 측정{" "}
+                  {((frame?.monitoredUs ?? 0) / SECOND).toFixed(3)}초 · 관측
+                  종료 {frame?.censoredCount ?? 0}건
+                </p>
+              )}
               <dl className="service-summary">
                 <div>
                   <dt>중단 횟수</dt>
@@ -1451,9 +1509,11 @@ export default function App() {
                       <span>
                         {r.status === "recovered"
                           ? `${(r.recoveryUs! / 1000).toFixed(3)} ms`
-                          : r.status === "unrecovered"
-                            ? "미복구"
-                            : "중단 중"}
+                          : r.status === "censored"
+                            ? "접속 변경으로 관측 종료"
+                            : r.status === "unrecovered"
+                              ? "미복구"
+                              : "중단 중"}
                       </span>
                       <small>
                         {r.reason === "initial-unreachable"
