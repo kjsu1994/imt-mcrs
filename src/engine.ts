@@ -1608,6 +1608,43 @@ export class SimulationEngine {
     if (done) this.nowUs = targetUs;
     return done;
   }
+  analysisSnapshot() {
+    if (this.needsWork)
+      throw new Error("현재 논리 시각의 계산이 완료되지 않았습니다.");
+    const p: ReturnType<typeof positions> = [];
+    for (const id of this.installed)
+      p[id] = position(
+        this.scenario.config,
+        id,
+        this.nowUs / SECOND,
+        this.scenario.epochMs,
+      );
+    const pathValid = this.validPath();
+    const ground = this.groundView(pathValid);
+    const candidate = this.currentPathMetrics(p).candidate;
+    const available = !this.failure && (ground ? ground.available : pathValid);
+    return {
+      timeUs: this.nowUs,
+      source: this.sourceNode,
+      target: this.targetNode,
+      path: [...this.installed],
+      available,
+      hopCount: available ? Math.max(0, this.installed.length - 1) : null,
+      metrics: available ? candidate : null,
+      endToEndPropagationMs:
+        available && candidate
+          ? Math.round(
+              (candidate.propagationDelayMs +
+                (ground
+                  ? ((ground.ut.distanceM! + ground.gs.distanceM!) /
+                      299792458) *
+                    1000
+                  : 0)) *
+                1e9,
+            ) / 1e9
+          : null,
+    };
+  }
   performanceReport() {
     return this.runtimeProfile?.report() ?? null;
   }

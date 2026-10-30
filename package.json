@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "benchmark:mcsr": "tsx scripts/benchmark-mcsr.ts",
     "benchmark:compare": "tsx scripts/compare-benchmarks.ts",
-    "benchmark:browser": "tsx scripts/benchmark-browser.ts"
+    "benchmark:browser": "tsx scripts/benchmark-browser.ts",
+    "analyze:compare": "tsx scripts/analyze-compare.ts"
   },
   "dependencies": {
     "cesium": "1.146.0",

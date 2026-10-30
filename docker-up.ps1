@@ -7,6 +7,11 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     if ($LASTEXITCODE -ne 0) { throw 'Docker Compose failed.' }
 } else {
     $usingWslDocker = $true
+    # Docker's systemd service alone does not keep an idle WSL distro alive.
+    $keepAliveTask = Get-ScheduledTask -TaskName 'MCSR-Sim-WSL' -ErrorAction SilentlyContinue
+    if ($keepAliveTask -and $keepAliveTask.State -ne 'Running') {
+        Start-ScheduledTask -TaskName 'MCSR-Sim-WSL'
+    }
     # WSL cannot read this machine's O: cloud drive; stage only build inputs on C:.
     wsl -d Ubuntu --cd / --exec docker info --format '{{.ServerVersion}}'
     if ($LASTEXITCODE -ne 0) { throw 'Start Docker in WSL Ubuntu first.' }

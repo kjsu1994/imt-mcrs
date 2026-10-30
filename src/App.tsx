@@ -1,3 +1,4 @@
+import AnalysisPanel from "./AnalysisPanel";
 import groundExample from "../examples/ground-72.json";
 import GroundPanel from "./GroundPanel";
 import { defaultGround } from "./ground";
@@ -5,7 +6,7 @@ import type { GroundSettings, GroundPoint, GroundRole } from "./ground";
 import { searchDefaults } from "./boundedSearch";
 import mcsr72 from "../examples/mcsr-72.json";
 import mcsr1584 from "../examples/mcsr-1584.json";
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import Globe from "./Globe";
 import mcsrExample from "../examples/mcsr-routing.json";
 import type { Telemetry } from "./Globe";
@@ -79,6 +80,10 @@ export default function App() {
     [inputError, setInputError] = useState(""),
     [left, setLeft] = useState(() => window.innerWidth > 850),
     [right, setRight] = useState(() => window.innerWidth > 850);
+  const [pendingReplay, setPendingReplay] = useState<{
+    scenario: Scenario;
+    atUs: number;
+  } | null>(null);
   const scenario = useMemo(
     () =>
       loadedScenario ?? {
@@ -143,35 +148,58 @@ export default function App() {
     validateScenario(next);
     setLoadedScenario(next);
   }
+  const loadScenario = useCallback((next: Scenario) => {
+    validateScenario(next);
+    setPendingReplay(null);
+    const experiment = {
+      durationSeconds: next.durationUs / SECOND,
+      slsMs: next.slsIntervalUs / 1000,
+      computeMs: next.computeDelayUs / 1000,
+      installMs: next.installDelayUs / 1000,
+      seed: next.seed,
+      notificationMs: next.notificationDelayUs / 1000,
+      switchMs: next.switchDelayUs / 1000,
+    };
+    setConfig(next.config);
+    setDraft(next.config);
+    setStartMs(next.epochMs);
+    setUtcDraft(new Date(next.epochMs).toISOString().slice(0, 19));
+    setExperiment(experiment);
+    setExperimentDraft(experiment);
+    setSource(next.source);
+    setTarget(next.target);
+    setSelected(null);
+    setTracking(false);
+    setPlaying(false);
+    setHome((v) => v + 1);
+    setLoadedScenario(next);
+    setInputError("");
+  }, []);
+  const replayAnalysis = useCallback(
+    (next: Scenario, atUs: number) => {
+      loadScenario(next);
+      setPendingReplay({ scenario: next, atUs });
+    },
+    [loadScenario],
+  );
+  useEffect(() => {
+    if (
+      pendingReplay &&
+      pendingReplay.scenario === scenario &&
+      frame &&
+      !simulation.busy
+    ) {
+      setPendingReplay(null);
+      simulation.seek(pendingReplay.atUs);
+    }
+  }, [pendingReplay, scenario, frame, simulation.busy]);
   async function importScenario(file: File) {
     try {
       if (file.size > 10 * 1024 * 1024)
         throw new Error("JSON은 10MB 이하여야 합니다.");
       const raw = JSON.parse(await file.text());
       const next = normalizeScenario(raw?.scenario ?? raw);
-      const experiment = {
-        durationSeconds: next.durationUs / SECOND,
-        slsMs: next.slsIntervalUs / 1000,
-        computeMs: next.computeDelayUs / 1000,
-        installMs: next.installDelayUs / 1000,
-        seed: next.seed,
-        notificationMs: next.notificationDelayUs / 1000,
-        switchMs: next.switchDelayUs / 1000,
-      };
-      setConfig(next.config);
-      setDraft(next.config);
-      setStartMs(next.epochMs);
-      setUtcDraft(new Date(next.epochMs).toISOString().slice(0, 19));
-      setExperiment(experiment);
-      setExperimentDraft(experiment);
-      setSource(next.source);
-      setTarget(next.target);
-      setSelected(null);
-      setTracking(false);
-      setPlaying(false);
-      setHome((v) => v + 1);
-      setLoadedScenario(next);
-      setInputError("");
+      loadScenario(next);
     } catch (e) {
       setInputError(e instanceof Error ? e.message : String(e));
     }
@@ -536,6 +564,7 @@ export default function App() {
                   }}
                 />
               </label>
+              <AnalysisPanel onReplay={replayAnalysis} />
               <label className="field">
                 라우팅 알고리즘
                 <select
